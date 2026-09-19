@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import base64
+import json
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 import aiohttp
+from yarl import URL
 
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, filter
@@ -23,7 +25,7 @@ except ImportError:
     Nodes = None  # type: ignore[assignment]
     _NODE_AVAILABLE = False
 
-from .bili_api import BiliSubscriptionClient, UserVideo
+from .bili_api import BiliSubscriptionClient, UserVideo, _USER_AGENT
 from .bili_player_bridge import (
     BiliVideoDownloader,
     has_bilibili_login,
@@ -101,6 +103,72 @@ def _parse_whitelist(raw: object) -> _AdminWhitelist:
     )
 
 
+async def _warmup_bilibili(
+    session: aiohttp.ClientSession, cache_path: Path
+) -> None:
+    """预访问 B 站首页，让 CookieJar 拿到 buvid3 / b_nut 等基础 Cookie。
+
+    - 先尝试从 cache_path 恢复上次的 buvid3，让"设备身份"连续；
+    - 再访问一次首页，拿到或刷新 cookie；
+    - 把 buvid3 / b_nut / _uuid 缓存到 cache_path。
+
+    这些 Cookie 无需登录即可获得，拿到后能显著降低被 412 的概率。
+    """
+    target_url = URL("https://www.bilibili.com/")
+
+    # 1) 尝试恢复历史 cookie
+    if cache_path.exists():
+        try:
+            saved = json.loads(cache_path.read_text(encoding="utf-8"))
+            if isinstance(saved, dict) and saved:
+                session.cookie_jar.update_cookies(
+                    saved, response_url=target_url
+                )
+                logger.info(
+                    "bili-subscription 已恢复 %d 个历史 Cookie", len(saved)
+                )
+        except Exception as exc:
+            logger.debug("bili-subscription 读取 buvid 缓存失败：%s", exc)
+
+    # 2) 预访问首页
+    try:
+        async with session.get(
+            "https://www.bilibili.com/",
+            headers={"User-Agent": _USER_AGENT},
+            timeout=aiohttp.ClientTimeout(total=10),
+        ) as resp:
+            await resp.read()
+    except Exception as exc:
+        logger.warning("bili-subscription 预访问首页失败（不影响运行）：%s", exc)
+        return
+
+    # 3) 提取并保存 buvid 相关 cookie
+    try:
+        jar = session.cookie_jar.filter_cookies(target_url)
+        fresh = {
+            name: morsel.value
+            for name, morsel in jar.items()
+            if name.startswith("buvid") or name in ("b_nut", "_uuid")
+        }
+        if fresh:
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            cache_path.write_text(
+                json.dumps(fresh, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            logger.info(
+                "bili-subscription 已获取设备标识：%s",
+                ", ".join(fresh.keys()),
+            )
+        else:
+            logger.warning(
+                "bili-subscription 预访问首页未拿到 buvid，"
+                "可能是网络问题或被风控，稍后会自动重试"
+            )
+    except Exception as exc:
+        logger.debug("bili-subscription 保存 buvid 缓存失败：%s", exc)
+
+
 class BiliSubscriptionPlugin(Star):
     def __init__(self, context: Context, config: dict[str, Any] | None = None) -> None:
         super().__init__(context, config)
@@ -159,6 +227,7 @@ class BiliSubscriptionPlugin(Star):
         """刷新配置、开关和订阅列表。无需重启即可生效。"""
         self._refresh_config_from_astrbot()
 
+        # 除订阅列表之外的开关也要热重载
         if self._pusher is not None:
             try:
                 self._pusher.update_options(
@@ -170,12 +239,6 @@ class BiliSubscriptionPlugin(Star):
                     ),
                     skip_empty_dynamic=bool(
                         self._config.get("skip_empty_dynamic", True)
-                    ),
-                    skip_forward_dynamic=bool(
-                        self._config.get("skip_forward_dynamic", True)
-                    ),
-                    fetch_article_images=bool(
-                        self._config.get("fetch_article_images", True)
                     ),
                     max_items_per_push=int(
                         self._config.get("max_items_per_push") or 5
@@ -272,9 +335,15 @@ class BiliSubscriptionPlugin(Star):
         )
 
         try:
+            # 预访问 B 站首页，拿到 buvid3 等基础 Cookie
+            await _warmup_bilibili(http, data_dir / "buvid_cache.json")
+
             client = BiliSubscriptionClient(
                 http,
                 credentials_getter=lambda: read_bilibili_cookies(bili_player_dir),
+                min_request_gap=float(
+                    self._config.get("min_request_gap_seconds") or 1.5
+                ),
             )
             store = SubscriptionStateStore(data_dir / "subscription_state.json")
             await store.load()
@@ -289,8 +358,9 @@ class BiliSubscriptionPlugin(Star):
                 logger.info("bili-subscription 检测到 B 站登录状态")
             else:
                 logger.warning(
-                    "bili-subscription 未检测到 B 站登录。"
-                    "请先在 astrbot_plugin_bili_player 的插件 Page 里扫码登录。"
+                    "bili-subscription 未检测到 B 站登录 —— "
+                    "未登录时 B 站风控极严，动态/专栏接口可能返回空或频繁限流。"
+                    "强烈建议在 astrbot_plugin_bili_player 的插件 Page 里扫码登录。"
                 )
 
             pusher = SubscriptionPusher(
@@ -311,13 +381,10 @@ class BiliSubscriptionPlugin(Star):
                 skip_empty_dynamic=bool(
                     self._config.get("skip_empty_dynamic", True)
                 ),
-                skip_forward_dynamic=bool(
-                    self._config.get("skip_forward_dynamic", True)
-                ),
-                fetch_article_images=bool(
-                    self._config.get("fetch_article_images", True)
-                ),
                 config_refresher=self._refresh_config_and_subs,
+                max_concurrent_checks=int(
+                    self._config.get("max_concurrent_checks") or 2
+                ),
             )
 
             subs, errors = self._parse_subs()
@@ -516,14 +583,6 @@ class BiliSubscriptionPlugin(Star):
             "空动态过滤："
             f"{'已开启' if self._config.get('skip_empty_dynamic', True) else '已关闭'}"
         )
-        lines.append(
-            "纯转发过滤："
-            f"{'已开启' if self._config.get('skip_forward_dynamic', True) else '已关闭'}"
-        )
-        lines.append(
-            "专栏正文图："
-            f"{'已开启' if self._config.get('fetch_article_images', True) else '已关闭'}"
-        )
 
         if not pil_available():
             lines.append("")
@@ -678,8 +737,6 @@ class BiliSubscriptionPlugin(Star):
             flags = []
             if d.is_original_video:
                 flags.append("视频动态")
-            if d.is_pure_forward:
-                flags.append("纯转发")
             if is_empty_dynamic(d):
                 flags.append("空动态")
             flag_text = ("  " + "/".join(flags)) if flags else ""
@@ -698,17 +755,6 @@ class BiliSubscriptionPlugin(Star):
         lines.append(f"专栏候选：{len(articles)} 条")
         for a in articles[:3]:
             lines.append(f"  {a.article_id}  {a.title[:40]}")
-        if articles and self._config.get("fetch_article_images", True):
-            try:
-                content = await self._client.fetch_article_content_images(
-                    articles[0].article_id
-                )
-                lines.append(
-                    f"  首条正文图：{len(content)} 张"
-                    + (f"（{content[0][:60]}…）" if content else "")
-                )
-            except Exception as exc:
-                lines.append(f"  正文图拉取异常：{exc}")
         stored_art = await self._store.get(uid, "article")
         lines.append(f"状态文件记录的 article：{stored_art or '（无）'}")
 

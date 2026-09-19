@@ -4,8 +4,9 @@
 - 首次检查某账号时只记录"当前最新"，不推送。
 - 之后每次发现新条目，从旧到新推送，状态推进到"最后一条成功的条目"。
 - 单条目连续失败超过 max_retries 次会被跳过，避免坏条目阻塞后续。
-- 多个订阅并发检查，一个慢账号不阻塞其他。
+- 多个订阅限并发检查（默认 2），防止大量请求同时打向 B 站。
 - 每轮 tick 前尝试刷新配置，用户改订阅后无需重启。
+- 每小时轻量检测一次 B 站登录态，失效时提醒用户重新登录。
 """
 
 from __future__ import annotations
@@ -34,9 +35,6 @@ SendVideoToSessions = Callable[[tuple[str, ...], UserVideo], Awaitable[bool]]
 ConfigRefresher = Callable[[], None]
 SendOne = Callable[[Any], Awaitable[bool]]
 
-_CARD_IMAGE_LIMIT = 6      # 卡片最多贴 6 张
-_FORWARD_IMAGE_LIMIT = 15  # 合并转发最多 15 张
-
 
 def is_empty_dynamic(dynamic: UserDynamic) -> bool:
     """动态既无文字也无图片时视为空动态。"""
@@ -64,10 +62,9 @@ class SubscriptionPusher:
         enable_video_push: bool = True,
         skip_video_dynamic: bool = True,
         skip_empty_dynamic: bool = True,
-        skip_forward_dynamic: bool = True,
-        fetch_article_images: bool = True,
         max_retries: int = 3,
         config_refresher: ConfigRefresher | None = None,
+        max_concurrent_checks: int = 2,
     ) -> None:
         self._client = client
         self._store = store
@@ -80,10 +77,14 @@ class SubscriptionPusher:
         self._enable_video_push = enable_video_push
         self._skip_video_dynamic = skip_video_dynamic
         self._skip_empty_dynamic = skip_empty_dynamic
-        self._skip_forward_dynamic = skip_forward_dynamic
-        self._fetch_article_images = fetch_article_images
         self._max_retries = max(1, max_retries)
         self._config_refresher = config_refresher
+
+        # 限并发：防止同一时刻大量请求打向 B 站
+        self._check_semaphore = asyncio.Semaphore(max(1, max_concurrent_checks))
+
+        # 每小时检测一次登录态
+        self._last_login_check = 0.0
 
         self._subscriptions: list[Subscription] = []
         self._last_check: dict[str, float] = {}
@@ -103,8 +104,6 @@ class SubscriptionPusher:
         enable_video_push: bool,
         skip_video_dynamic: bool,
         skip_empty_dynamic: bool,
-        skip_forward_dynamic: bool,
-        fetch_article_images: bool,
         max_items_per_push: int,
         scan_interval_seconds: int,
         font_path: str | None,
@@ -113,8 +112,6 @@ class SubscriptionPusher:
         self._enable_video_push = enable_video_push
         self._skip_video_dynamic = skip_video_dynamic
         self._skip_empty_dynamic = skip_empty_dynamic
-        self._skip_forward_dynamic = skip_forward_dynamic
-        self._fetch_article_images = fetch_article_images
         self._max_items = max(1, max_items_per_push)
         self._scan_interval = max(10, scan_interval_seconds)
         self._font_path = font_path
@@ -178,20 +175,13 @@ class SubscriptionPusher:
             articles = []
 
         if articles:
-            article = articles[0]
-            if self._fetch_article_images:
-                content_images = await self._client.fetch_article_content_images(
-                    article.article_id
-                )
-                if content_images:
-                    article = self._with_content_images(article, content_images)
             sub = Subscription(
                 uid=uid,
                 sessions=(session_id,),
                 types=frozenset({"article"}),
             )
-            if await self._push_article(sub, article):
-                lines.append(f"已推送最新专栏：{article.article_id}")
+            if await self._push_article(sub, articles[0]):
+                lines.append(f"已推送最新专栏：{articles[0].article_id}")
             else:
                 lines.append("专栏推送失败")
         else:
@@ -233,11 +223,20 @@ class SubscriptionPusher:
                 pass
 
     async def _tick(self) -> None:
+        # 每轮 tick 都尝试刷新配置，用户在 WebUI 改订阅后无需重启
         if self._config_refresher is not None:
             try:
                 self._config_refresher()
             except Exception:
                 logger.exception("bili-subscription 刷新配置失败")
+
+        # 每小时轻量检测一次登录态
+        if time.monotonic() - self._last_login_check > 3600:
+            self._last_login_check = time.monotonic()
+            try:
+                await self._client.check_login()
+            except Exception:
+                logger.exception("bili-subscription 登录态检测异常")
 
         now = time.monotonic()
         due: list[Subscription] = []
@@ -257,10 +256,11 @@ class SubscriptionPusher:
         await self._safe_save()
 
     async def _safe_check(self, sub: Subscription) -> None:
-        try:
-            await self._check(sub)
-        except Exception:
-            logger.exception("bili-subscription 检查 UID %s 失败", sub.uid)
+        async with self._check_semaphore:
+            try:
+                await self._check(sub)
+            except Exception:
+                logger.exception("bili-subscription 检查 UID %s 失败", sub.uid)
 
     async def _safe_save(self) -> None:
         try:
@@ -269,6 +269,10 @@ class SubscriptionPusher:
             logger.exception("bili-subscription 保存状态失败")
 
     async def _check(self, sub: Subscription) -> list[str]:
+        """检查一个订阅。每类内容独立 try，返回错误消息列表。
+
+        返回值用于 ``订阅检查`` 命令展示，不抛异常。
+        """
         errors: list[str] = []
 
         if "video" in sub.types and self._enable_video_push:
@@ -319,51 +323,9 @@ class SubscriptionPusher:
         articles = await self._client.fetch_articles(sub.uid, limit=self._max_items)
         if not articles:
             return
-
-        # 若开启，为每条待推送的专栏拉一次详情取正文图
-        if self._fetch_article_images:
-            articles = await self._enrich_articles_with_content(articles)
-
         await self._process_items(
             sub, articles, "article",
             partial(self._push_article, sub),
-        )
-
-    async def _enrich_articles_with_content(
-        self, articles: list[UserArticle]
-    ) -> list[UserArticle]:
-        """为专栏补上正文图；某条失败不影响其他条。"""
-        enriched: list[UserArticle] = []
-        for article in articles:
-            try:
-                content = await self._client.fetch_article_content_images(
-                    article.article_id
-                )
-            except Exception:
-                content = ()
-            enriched.append(
-                self._with_content_images(article, content) if content else article
-            )
-        return enriched
-
-    @staticmethod
-    def _with_content_images(
-        article: UserArticle, content_images: tuple[str, ...]
-    ) -> UserArticle:
-        """合并封面 + 正文图（去重，保留顺序）。"""
-        seen: set[str] = set()
-        merged: list[str] = []
-        for url in (*article.covers, *content_images):
-            if url and url not in seen:
-                seen.add(url)
-                merged.append(url)
-        return UserArticle(
-            article_id=article.article_id,
-            title=article.title,
-            summary=article.summary,
-            covers=tuple(merged[:3]),
-            created_at=article.created_at,
-            content_images=tuple(merged),
         )
 
     # ------------------------------------------------------------------
@@ -375,6 +337,7 @@ class SubscriptionPusher:
         newest_id = self._id_of(items[0], kind)
         last = await self._store.get(sub.uid, kind)
 
+        # 首次：只记录，不推送
         if last is None:
             await self._store.set(sub.uid, kind, newest_id)
             logger.info(
@@ -384,6 +347,7 @@ class SubscriptionPusher:
 
         new_items, found = self._collect_new(items, last, kind)
 
+        # last 不在最近列表中：保守只推最新一条（也要检查失败上限）
         if not found:
             fallback = items[0]
             fallback_id = self._id_of(fallback, kind)
@@ -399,6 +363,7 @@ class SubscriptionPusher:
             )
             new_items = [fallback]
 
+        # 没有新条目：如果 newest 变了，说明都被过滤了，推进状态避免卡死
         if not new_items:
             if newest_id != last:
                 logger.warning(
@@ -410,6 +375,7 @@ class SubscriptionPusher:
 
         logger.info("UID %s %s 发现新条目 %d 条", sub.uid, kind, len(new_items))
 
+        # 从旧到新推送，状态推进到最后一条成功的
         last_success_id: str | None = None
         for item in reversed(new_items):
             item_id = self._id_of(item, kind)
@@ -425,7 +391,7 @@ class SubscriptionPusher:
             else:
                 self._note_failure(kind, item_id)
                 logger.warning("推送 %s %s 失败，稍后重试", kind, item_id)
-                break
+                break  # 保持顺序：失败之后的条目不再推送
 
         if last_success_id is not None:
             await self._store.set(sub.uid, kind, last_success_id)
@@ -498,8 +464,6 @@ class SubscriptionPusher:
             flags = []
             if latest.is_original_video:
                 flags.append("视频动态")
-            if latest.is_pure_forward:
-                flags.append("纯转发")
             if is_empty_dynamic(latest):
                 flags.append("空动态")
             flag_text = ("  " + "/".join(flags)) if flags else ""
@@ -519,21 +483,9 @@ class SubscriptionPusher:
             return f"   专栏抓取异常：{exc}"
         lines = [f"   专栏候选：{len(articles)} 条"]
         if articles:
-            latest = articles[0]
             lines.append(
-                f"     最新：{latest.article_id} 标题 {latest.title[:40]}"
+                f"     最新：{articles[0].article_id} 标题 {articles[0].title[:40]}"
             )
-            if self._fetch_article_images:
-                try:
-                    content = await self._client.fetch_article_content_images(
-                        latest.article_id
-                    )
-                except Exception as exc:
-                    lines.append(f"     正文图拉取异常：{exc}")
-                    content = ()
-                lines.append(
-                    f"     封面 {len(latest.covers)} 张，正文图 {len(content)} 张"
-                )
         return "\n".join(lines)
 
     # ------------------------------------------------------------------
@@ -542,11 +494,9 @@ class SubscriptionPusher:
     async def _send_dynamic_one(
         self, sub: Subscription, dynamic: UserDynamic
     ) -> bool:
+        """过滤 + 推送。返回 True 表示"已处理"（跳过也算处理）。"""
         if self._skip_video_dynamic and dynamic.is_original_video:
             logger.debug("跳过视频动态 %s", dynamic.dynamic_id)
-            return True
-        if self._skip_forward_dynamic and dynamic.is_pure_forward:
-            logger.debug("跳过纯转发动态 %s", dynamic.dynamic_id)
             return True
         if self._skip_empty_dynamic and is_empty_dynamic(dynamic):
             logger.debug("跳过空动态 %s", dynamic.dynamic_id)
@@ -556,8 +506,7 @@ class SubscriptionPusher:
     async def _push_dynamic(
         self, sub: Subscription, dynamic: UserDynamic
     ) -> bool:
-        image_urls = dynamic.image_urls[:_CARD_IMAGE_LIMIT]
-        image_bytes = await self._download_images(image_urls)
+        image_bytes = await self._download_images(dynamic.image_urls)
         card = await render_card(
             title="B 站动态更新",
             body=dynamic.text or "（无文字内容）",
@@ -573,28 +522,17 @@ class SubscriptionPusher:
     async def _push_article(
         self, sub: Subscription, article: UserArticle
     ) -> bool:
-        # 有正文图就用合并后的列表，否则回退到封面
-        all_urls = article.content_images or article.covers
-        card_urls = all_urls[:_CARD_IMAGE_LIMIT]
-        forward_urls = all_urls[:_FORWARD_IMAGE_LIMIT]
-
-        card_images = await self._download_images(card_urls)
-        forward_images = (
-            card_images
-            if len(forward_urls) == len(card_urls)
-            else await self._download_images(forward_urls)
-        )
-
+        image_bytes = await self._download_images(article.covers)
         body = f"{article.title}\n\n{article.summary}"
         card = await render_card(
             title="B 站专栏更新",
             body=body,
-            images=card_images,
+            images=image_bytes,
             footer=f"https://www.bilibili.com/read/cv{article.article_id}",
             font_path=self._font_path,
         )
         return await self._broadcast(
-            sub.sessions, card, forward_images,
+            sub.sessions, card, image_bytes,
             content_id=article.article_id, kind="专栏",
         )
 

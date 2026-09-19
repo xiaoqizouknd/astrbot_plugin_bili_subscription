@@ -1,4 +1,11 @@
-"""B 站 API 客户端：订阅抓取、视频解析、专栏详情、媒体下载。
+"""B 站 API 客户端：订阅抓取、视频解析、媒体下载。
+
+防风控策略：
+- 全局请求节流（两次请求之间至少间隔 N 秒）；
+- 请求头补全（Origin / Accept-Language）；
+- Cookie 30 秒缓存，避免高频读文件；
+- 遇到限流错误码（-352 / -412 / 429 等）自动指数退避重试；
+- 提供 check_login() 供上层定期检测登录态。
 
 接口失败抛 ``BiliApiError``（携带 B 站业务码），由调度层决定如何处理。
 图片下载失败只写 debug 日志，不影响主流程。
@@ -9,7 +16,6 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
-import re
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -27,7 +33,6 @@ _NAV_URL = f"{API_ORIGIN}/x/web-interface/nav"
 _DYNAMIC_URL = f"{API_ORIGIN}/x/polymer/web-dynamic/v1/feed/space"
 _VIDEO_LIST_URL = f"{API_ORIGIN}/x/space/wbi/arc/search"
 _ARTICLE_URL = f"{API_ORIGIN}/x/space/wbi/article"
-_ARTICLE_VIEW_URL = f"{API_ORIGIN}/x/article/view"
 _VIEW_URL = f"{API_ORIGIN}/x/web-interface/wbi/view"
 _PLAY_URL = f"{API_ORIGIN}/x/player/wbi/playurl"
 
@@ -41,19 +46,6 @@ _WBI_TTL = 600
 _DASH_VIDEO_QUALITY = 32
 _IMAGE_MAX_BYTES = 8 * 1024 * 1024
 
-# 转发动态里 B 站可能返回的占位符，视为"转发者无评论"
-_PURE_FORWARD_TEXTS = frozenset({
-    "转发动态",
-    "转发",
-    "转发微博",
-    "轉發動態",
-})
-
-# 专栏详情里的 <img> 标签，src 可能是 //i0.hdslb.com/... 或 http(s)://...
-_ARTICLE_IMG_RE = re.compile(
-    r'<img[^>]+src="([^"]+)"', re.IGNORECASE
-)
-
 _MIXIN_INDICES = (
     46, 47, 18, 2, 53, 8, 23, 32, 15, 50, 10, 31, 58, 3, 45, 35,
     27, 43, 5, 49, 33, 9, 42, 19, 29, 28, 14, 39, 12, 38, 41, 13,
@@ -61,6 +53,16 @@ _MIXIN_INDICES = (
     22, 25, 54, 21, 56, 62, 6, 63, 57, 20, 34, 52, 59, 11, 36, 44,
 )
 _FILTER = str.maketrans("", "", "!'()*")
+
+# 表示"暂时被限流"的错误码，适合退避后重试。
+# B 站业务码 + HTTP 状态码都要覆盖。
+_RETRYABLE_CODES = frozenset({
+    -352, -412, -509, -799,                # B 站业务码：风控 / 拦截 / 限流
+    408, 412, 429, 500, 502, 503, 504,     # HTTP 状态码
+})
+
+# 退避等待序列，单位秒
+_BACKOFF_DELAYS = (5.0, 15.0, 60.0)
 
 CredentialsGetter = Callable[[], Mapping[str, str]]
 
@@ -92,8 +94,6 @@ class UserArticle:
     summary: str
     covers: tuple[str, ...]
     created_at: int
-    # 正文内嵌图，从详情页抽取；详情拉取失败时为 ()
-    content_images: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -104,7 +104,6 @@ class UserDynamic:
     created_at: int
     kind: str
     is_original_video: bool = False
-    is_pure_forward: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -178,21 +177,29 @@ class BiliSubscriptionClient:
         self,
         session: aiohttp.ClientSession,
         credentials_getter: CredentialsGetter | None = None,
+        *,
+        min_request_gap: float = 1.5,
     ) -> None:
         self._session = session
         self._credentials_getter = credentials_getter
         self._wbi_key: str | None = None
         self._wbi_expires = 0.0
         self._wbi_lock = asyncio.Lock()
-        # 专栏详情接口有风控，简单串行化 + 间隔
-        self._article_lock = asyncio.Lock()
-        self._last_article_fetch = 0.0
+
+        # 全局请求节流：两次请求之间至少间隔 _min_gap 秒
+        self._min_gap = max(0.0, float(min_request_gap))
+        self._last_request_ts = 0.0
+        self._request_lock = asyncio.Lock()
+
+        # Cookie 缓存，避免高频读文件
+        self._cred_cache: dict[str, str] = {}
+        self._cred_expires = 0.0
 
     # ------------------------------------------------------------------
     # 订阅抓取
     # ------------------------------------------------------------------
     async def fetch_videos(self, uid: str, *, limit: int = 5) -> list[UserVideo]:
-        data = await self._request(
+        data = await self._request_with_backoff(
             _VIDEO_LIST_URL,
             {"mid": uid, "ps": limit, "pn": 1, "order": "pubdate"},
             wbi=True,
@@ -219,7 +226,7 @@ class BiliSubscriptionClient:
         return result
 
     async def fetch_articles(self, uid: str, *, limit: int = 5) -> list[UserArticle]:
-        data = await self._request(
+        data = await self._request_with_backoff(
             _ARTICLE_URL,
             {"mid": uid, "ps": limit, "pn": 1, "sort": "publish_time"},
             wbi=True,
@@ -235,10 +242,7 @@ class BiliSubscriptionClient:
             if not article_id:
                 continue
             covers = raw.get("image_urls") or []
-            cover_list = tuple(
-                _normalize_image_url(str(c)) for c in covers if isinstance(c, str)
-            )
-            cover_list = tuple(u for u in cover_list if u)
+            cover_list = tuple(str(c) for c in covers if isinstance(c, str))
             result.append(
                 UserArticle(
                     article_id=article_id,
@@ -250,95 +254,9 @@ class BiliSubscriptionClient:
             )
         return result
 
-    async def fetch_article_content_images(
-        self, article_id: str, *, max_images: int = 15
-    ) -> tuple[str, ...]:
-        """拉专栏详情，从 HTML 正文中抽取内嵌图片。
-
-        失败不抛异常，返回空 tuple，由调用方决定降级策略。
-        风控（-509/-352 等）同样降级，不阻塞主流程。
-        """
-        if not article_id:
-            return ()
-
-        # 简单串行 + 间隔，避免触发风控
-        async with self._article_lock:
-            elapsed = time.monotonic() - self._last_article_fetch
-            if elapsed < 0.5:
-                await asyncio.sleep(0.5 - elapsed)
-            self._last_article_fetch = time.monotonic()
-
-        try:
-            data = await self._request(
-                _ARTICLE_VIEW_URL,
-                {"id": article_id},
-                wbi=False,
-                referer=f"https://www.bilibili.com/read/cv{article_id}",
-            )
-        except BiliApiError as exc:
-            logger.debug(
-                "bili-api 专栏详情 %s 拉取失败（%s），降级为仅封面",
-                article_id, exc,
-            )
-            return ()
-        except Exception as exc:
-            logger.debug(
-                "bili-api 专栏详情 %s 异常（%s），降级为仅封面",
-                article_id, exc,
-            )
-            return ()
-
-        content_html = str(data.get("content") or "")
-        if not content_html:
-            return ()
-
-        seen: set[str] = set()
-        images: list[str] = []
-
-        def _add(value: str) -> None:
-            url = _normalize_image_url(value)
-            if url and url not in seen:
-                seen.add(url)
-                images.append(url)
-
-        # 新版专栏正文是 Quill Delta JSON：图片在 insert 的
-        # native-image / image 字段里，而不是 HTML <img>。
-        text = content_html.strip()
-        if text.startswith("{"):
-            try:
-                doc = json.loads(text)
-            except (ValueError, TypeError):
-                doc = None
-            if isinstance(doc, Mapping):
-                for op in doc.get("ops", []):
-                    if not isinstance(op, Mapping):
-                        continue
-                    ins = op.get("insert")
-                    if isinstance(ins, Mapping):
-                        native = ins.get("native-image")
-                        if isinstance(native, Mapping):
-                            _add(str(native.get("url") or ""))
-                        elif "image" in ins:
-                            img = ins.get("image")
-                            if isinstance(img, Mapping):
-                                _add(str(img.get("url") or ""))
-                            elif isinstance(img, str):
-                                _add(img)
-                    if len(images) >= max_images:
-                        break
-
-        # 兼容旧版 HTML 正文
-        if not images:
-            for match in _ARTICLE_IMG_RE.finditer(content_html):
-                _add(match.group(1))
-                if len(images) >= max_images:
-                    break
-
-        return tuple(images[:max_images])
-
     async def fetch_dynamics(self, uid: str, *, limit: int = 5) -> list[UserDynamic]:
         # 动态接口不需要 WBI 签名（B 站当前行为），不要擅自改成 True。
-        data = await self._request(
+        data = await self._request_with_backoff(
             _DYNAMIC_URL,
             {"host_mid": uid, "timezone_offset": -480, "offset": ""},
             wbi=False,
@@ -352,6 +270,23 @@ class BiliSubscriptionClient:
             if parsed is not None:
                 result.append(parsed)
         return result
+
+    # ------------------------------------------------------------------
+    # 登录态检测
+    # ------------------------------------------------------------------
+    async def check_login(self) -> bool:
+        """轻量检测当前 Cookie 是否仍有效。不抛异常。"""
+        try:
+            data = await self._request(_NAV_URL, {}, wbi=False)
+        except BiliApiError:
+            return False
+        is_login = bool(data.get("isLogin"))
+        if not is_login:
+            logger.warning(
+                "bili-subscription B 站登录态已失效，"
+                "请在 astrbot_plugin_bili_player 里重新扫码登录。"
+            )
+        return is_login
 
     # ------------------------------------------------------------------
     # 视频解析与下载
@@ -532,6 +467,10 @@ class BiliSubscriptionClient:
             return False
 
     def _credentials(self) -> dict[str, str]:
+        now = time.monotonic()
+        if self._cred_cache and now < self._cred_expires:
+            return self._cred_cache
+
         if self._credentials_getter is None:
             return {}
         try:
@@ -540,12 +479,16 @@ class BiliSubscriptionClient:
             return {}
         if not isinstance(cookies, Mapping):
             return {}
-        return {
+
+        result = {
             str(name): str(value)
             for name, value in cookies.items()
             if isinstance(name, str) and isinstance(value, str) and value
             and "\r" not in value and "\n" not in value
         }
+        self._cred_cache = result
+        self._cred_expires = now + 30.0
+        return result
 
     def _cookie_header(self) -> str:
         return "; ".join(
@@ -556,7 +499,9 @@ class BiliSubscriptionClient:
         headers = {
             "User-Agent": _USER_AGENT,
             "Referer": referer,
+            "Origin": "https://www.bilibili.com",
             "Accept": "application/json, text/plain, */*",
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
         }
         cookie_header = self._cookie_header()
         if cookie_header:
@@ -567,7 +512,9 @@ class BiliSubscriptionClient:
         headers = {
             "User-Agent": _USER_AGENT,
             "Referer": f"https://www.bilibili.com/video/{bvid}/",
+            "Origin": "https://www.bilibili.com",
             "Accept": "*/*",
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
         }
         cookie_header = self._cookie_header()
         if cookie_header:
@@ -575,19 +522,23 @@ class BiliSubscriptionClient:
         return headers
 
     async def _request(
-        self,
-        url: str,
-        params: Mapping[str, Any],
-        *,
-        wbi: bool,
-        referer: str = "https://space.bilibili.com/",
+        self, url: str, params: Mapping[str, Any], *, wbi: bool
     ) -> dict[str, Any]:
+        # 全局请求节流：保证两次请求之间至少间隔 _min_gap 秒
+        if self._min_gap > 0:
+            async with self._request_lock:
+                now = time.monotonic()
+                wait = self._min_gap - (now - self._last_request_ts)
+                if wait > 0:
+                    await asyncio.sleep(wait)
+                self._last_request_ts = time.monotonic()
+
         final_params = dict(params)
         if wbi:
             key = await self._get_wbi_key()
             final_params = _sign_params(final_params, key)
 
-        headers = self._base_headers(referer=referer)
+        headers = self._base_headers(referer="https://space.bilibili.com/")
         try:
             async with self._session.get(
                 url, params=final_params, headers=headers,
@@ -611,6 +562,14 @@ class BiliSubscriptionClient:
             raise BiliApiError("B 站返回了非 JSON 数据")
         code = _to_int(payload.get("code"), -1)
         if code != 0:
+            if code == -352:
+                raise BiliApiError(
+                    "B 站风控校验失败（-352）。建议："
+                    "① 等待 5-10 分钟后重试；"
+                    "② 在浏览器打开一次 B 站动态页面手动过验证码；"
+                    "③ 确认已扫码登录且 Cookie 未过期。",
+                    code=code,
+                )
             raise BiliApiError(
                 f"B 站接口错误 {code}：{payload.get('message') or ''}",
                 code=code,
@@ -619,6 +578,37 @@ class BiliSubscriptionClient:
         if not isinstance(data, dict):
             raise BiliApiError("B 站返回了未知数据")
         return data
+
+    async def _request_with_backoff(
+        self,
+        url: str,
+        params: Mapping[str, Any],
+        *,
+        wbi: bool,
+        max_attempts: int = 3,
+    ) -> dict[str, Any]:
+        """带指数退避的请求，仅对可重试错误码生效。
+
+        适合列表类接口（fetch_*）；视频流解析和下载请用普通 _request。
+        """
+        last_exc: BiliApiError | None = None
+        for attempt in range(max_attempts):
+            try:
+                return await self._request(url, params, wbi=wbi)
+            except BiliApiError as exc:
+                last_exc = exc
+                if exc.code not in _RETRYABLE_CODES:
+                    raise
+                if attempt == max_attempts - 1:
+                    break
+                delay = _BACKOFF_DELAYS[min(attempt, len(_BACKOFF_DELAYS) - 1)]
+                logger.warning(
+                    "bili-subscription B 站限流（code=%s），%.0f 秒后重试（%d/%d）",
+                    exc.code, delay, attempt + 1, max_attempts,
+                )
+                await asyncio.sleep(delay)
+        assert last_exc is not None
+        raise last_exc
 
     async def _get_wbi_key(self) -> str:
         now = time.monotonic()
@@ -743,18 +733,6 @@ def _parse_duration(text: str) -> int:
     return seconds
 
 
-def _normalize_image_url(value: str) -> str:
-    """把 //i0.hdslb.com/... 补成 https://i0.hdslb.com/..."""
-    url = str(value or "").strip()
-    if not url:
-        return ""
-    if url.startswith("//"):
-        url = f"https:{url}"
-    if not url.startswith(("http://", "https://")):
-        return ""
-    return url
-
-
 def _parse_dynamic(raw: Any) -> UserDynamic | None:
     if not isinstance(raw, Mapping):
         return None
@@ -783,17 +761,11 @@ def _parse_dynamic(raw: Any) -> UserDynamic | None:
                 if isinstance(items, list):
                     for item in items:
                         if isinstance(item, Mapping):
-                            src = _normalize_image_url(str(item.get("src") or ""))
+                            src = str(item.get("src") or "").strip()
                             if src:
+                                if not src.startswith("http"):
+                                    src = f"https:{src}"
                                 image_urls.append(src)
-
-    # 只认原创投稿视频动态，避免误伤"转发他人视频"的图文动态
-    is_original_video = kind == "DYNAMIC_TYPE_AV"
-
-    # 纯转发：转发者没写评论，或只写了"转发动态"这类占位符
-    is_pure_forward = kind == "DYNAMIC_TYPE_FORWARD" and (
-        not text or text in _PURE_FORWARD_TEXTS
-    )
 
     return UserDynamic(
         dynamic_id=dynamic_id,
@@ -801,6 +773,6 @@ def _parse_dynamic(raw: Any) -> UserDynamic | None:
         image_urls=tuple(image_urls[:6]),
         created_at=created_at,
         kind=kind,
-        is_original_video=is_original_video,
-        is_pure_forward=is_pure_forward,
+        # 只认原创投稿视频动态，避免误伤"转发他人视频"的图文动态
+        is_original_video=(kind == "DYNAMIC_TYPE_AV"),
     )

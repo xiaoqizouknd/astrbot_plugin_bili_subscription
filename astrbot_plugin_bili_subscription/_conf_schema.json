@@ -50,6 +50,19 @@
     "default": 60,
     "slider": { "min": 30, "max": 600, "step": 30 }
   },
+  "min_request_gap_seconds": {
+    "description": "两次请求之间的最小间隔（秒）",
+    "type": "float",
+    "default": 1.5,
+    "hint": "值越大越不容易触发 B 站风控，但推送速度会变慢。\n推荐 1.0 ~ 3.0，默认 1.5。\n订阅数越多、越容易限流，就应该调得越大。"
+  },
+  "max_concurrent_checks": {
+    "description": "同时检查的订阅数上限",
+    "type": "int",
+    "default": 2,
+    "slider": { "min": 1, "max": 5, "step": 1 },
+    "hint": "设为 1 表示完全串行（最安全但最慢），2~3 兼顾速度和安全。\n配合上面的\"请求最小间隔\"一起使用。"
+  },
   "max_items_per_push": {
     "description": "单账号单次最多推送条数",
     "type": "int",
@@ -81,17 +94,5 @@
     "description": "屏蔽空动态（既无文字也无图片）",
     "type": "bool",
     "default": true
-  },
-  "skip_forward_dynamic": {
-    "description": "屏蔽纯转发（转发者没写评论的转发）",
-    "type": "bool",
-    "default": true,
-    "hint": "转发者如果写了自己的评论，仍会推送。开启后可避免转发刷屏。"
-  },
-  "fetch_article_images": {
-    "description": "抓取专栏正文图片",
-    "type": "bool",
-    "default": true,
-    "hint": "推送专栏时额外请求一次详情页，把正文里的内嵌图也发出来。关闭后只发封面图。若遇到 B 站风控（-509），可以关掉。"
   }
 }
