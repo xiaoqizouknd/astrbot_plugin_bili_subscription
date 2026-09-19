@@ -1,6 +1,8 @@
 # B站订阅推送
 
 自动监控 B 站账号的新视频、动态与专栏，推送到指定群聊。
+本插件只是小白用deepseek跑出来的代码，仅供参考，作者电脑可以使用
+不保证所有人都可以
 
 ## 功能
 
@@ -11,6 +13,7 @@
 
 ## 依赖
 
+-https://github.com/57Darling02/astrbot_plugin_bili_player的b站登陆插件
 - AstrBot `>=4.26,<5`
 - Python `>=3.10`
 - `ffmpeg`：用于视频封装，未安装时视频推送跳过
