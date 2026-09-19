@@ -1,0 +1,97 @@
+{
+  "subscriptions": {
+    "type": "template_list",
+    "description": "订阅列表（点“添加”新增一条）",
+    "default": [],
+    "hint": "每条订阅填两个数字就够了：B站UID 和 群号。\nB站UID 从个人空间地址里取：例如 space.bilibili.com/2267573，2267573 就是 UID。\n群号可以直接填纯数字，也可以填完整会话 ID（例如 default:GroupMessage:123456789）。",
+    "templates": {
+      "subscription": {
+        "name": "订阅",
+        "items": {
+          "uid": {
+            "type": "string",
+            "description": "B站UID（纯数字）"
+          },
+          "group_id": {
+            "type": "string",
+            "description": "要推送的群号（纯数字或完整会话 ID）"
+          }
+        }
+      }
+    }
+  },
+  "admin_whitelist": {
+    "description": "管理员白名单（只有这些人/群可以使用管理命令）",
+    "type": "string",
+    "default": "",
+    "hint": "逗号或换行分隔，可以是群号或用户号。\n例如：123456789,987654321\n\n留空时禁用所有管理命令。\n可加 u: 前缀只匹配用户号，g: 前缀只匹配群号。"
+  },
+  "default_types": {
+    "description": "默认推送类型（所有订阅共用）",
+    "type": "string",
+    "default": "video,dynamic,article",
+    "hint": "可选 video、dynamic、article，英文逗号分隔。"
+  },
+  "default_interval_minutes": {
+    "description": "默认检查间隔（分钟）",
+    "type": "int",
+    "default": 15,
+    "slider": { "min": 1, "max": 120, "step": 1 }
+  },
+  "platform_adapter": {
+    "description": "平台适配器实例名（一般留空）",
+    "type": "string",
+    "default": "",
+    "hint": "留空时自动从 AstrBot 读取第一个启用的平台实例 ID。"
+  },
+  "scan_interval_seconds": {
+    "description": "后台扫描间隔（秒）",
+    "type": "int",
+    "default": 60,
+    "slider": { "min": 30, "max": 600, "step": 30 }
+  },
+  "max_items_per_push": {
+    "description": "单账号单次最多推送条数",
+    "type": "int",
+    "default": 5,
+    "slider": { "min": 1, "max": 10, "step": 1 }
+  },
+  "image_font_path": {
+    "description": "渲染图片字体路径（可选，留空自动探测）",
+    "type": "string",
+    "default": ""
+  },
+  "enable_video_push": {
+    "description": "是否推送视频",
+    "type": "bool",
+    "default": true
+  },
+  "enable_node_forward": {
+    "description": "是否以合并转发（聊天记录）形式发送动态/专栏图片",
+    "type": "bool",
+    "default": true
+  },
+  "skip_video_dynamic": {
+    "description": "动态是原创投稿视频时不推送",
+    "type": "bool",
+    "default": true,
+    "hint": "避免视频和动态重复推送；转发他人视频的图文动态不受影响。"
+  },
+  "skip_empty_dynamic": {
+    "description": "屏蔽空动态（既无文字也无图片）",
+    "type": "bool",
+    "default": true
+  },
+  "skip_forward_dynamic": {
+    "description": "屏蔽纯转发（转发者没写评论的转发）",
+    "type": "bool",
+    "default": true,
+    "hint": "转发者如果写了自己的评论，仍会推送。开启后可避免转发刷屏。"
+  },
+  "fetch_article_images": {
+    "description": "抓取专栏正文图片",
+    "type": "bool",
+    "default": true,
+    "hint": "推送专栏时额外请求一次详情页，把正文里的内嵌图也发出来。关闭后只发封面图。若遇到 B 站风控（-509），可以关掉。"
+  }
+}
