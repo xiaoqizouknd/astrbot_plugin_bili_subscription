@@ -13,7 +13,7 @@
 
 ## 依赖
 
--https://github.com/57Darling02/astrbot_plugin_bili_player的b站登陆插件
+-https://github.com/57Darling02/astrbot_plugin_bili_player 的b站登陆插件
 - AstrBot `>=4.26,<5`
 - Python `>=3.10`
 - `ffmpeg`：用于视频封装，未安装时视频推送跳过
