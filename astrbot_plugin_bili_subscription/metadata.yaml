@@ -2,7 +2,7 @@ name: astrbot_plugin_bili_subscription
 display_name: B站订阅推送
 desc: 自动监控 B 站账号的新视频、动态与专栏，推送到指定群聊。
 short_desc: B 站账号更新自动推送。
-version: 1.0.0
+version: 1.1.0
 astrbot_version: ">=4.26,<5"
 author: 57Darling02
 repo: https://github.com/57Darling02/astrbot_plugin_bili_subscription
@@ -14,6 +14,7 @@ readme: |
   2. **插件配置 → 订阅列表**：点“添加”，每行只填「B站UID」和「群号」两栏。
      - UID 从 `space.bilibili.com/2267573` 里取数字部分。
      - 群号可以填纯数字，也可以填完整会话 ID。
+     - 也可以直接在群里发「订阅 2267573」添加订阅，无需进 WebUI。
   3. **建议**：装 `astrbot_plugin_bili_player` 并扫码登录 B 站，
      部分 UP 主的动态接口需要登录。
 
@@ -22,6 +23,8 @@ readme: |
   - `Pillow`：合成卡片需要；未装则动态/专栏无法发送。
 
   ## 管理命令（仅白名单用户）
+  - `订阅 <UID> [群号] [类型] [间隔分钟]` — 在聊天里添加订阅（不用进 WebUI）
+  - `退订 <UID> [all]` — 移除当前会话（或全部）的命令订阅
   - `订阅状态` — 查看订阅、登录状态、依赖健康
   - `订阅干跑` — 抓取 + 渲染，不发送，用来排查
   - `订阅检查` — 立即执行一次检查
@@ -32,3 +35,4 @@ readme: |
   - 改配置后**无需重启**，下一次扫描自动生效。
   - 首次检查某 UID 只记录“当前最新”，不推历史内容。
   - 推送失败的条目会自动重试；连续失败 3 次后跳过。
+  - 支持静音时段：时段内暂停检查，结束后自动补推。

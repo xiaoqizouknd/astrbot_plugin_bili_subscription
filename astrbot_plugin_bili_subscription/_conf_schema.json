@@ -15,6 +15,17 @@
           "group_id": {
             "type": "string",
             "description": "要推送的群号（纯数字或完整会话 ID）"
+          },
+          "types": {
+            "type": "string",
+            "description": "推送类型（可选，留空用全局默认）",
+            "default": "",
+            "hint": "video=视频，dynamic=动态，article=专栏，英文逗号分隔。留空使用「默认推送类型」。"
+          },
+          "interval_minutes": {
+            "type": "int",
+            "description": "检查间隔分钟（可选，0 或留空用全局默认）",
+            "default": 0
           }
         }
       }
@@ -54,20 +65,42 @@
     "description": "两次请求之间的最小间隔（秒）",
     "type": "float",
     "default": 1.5,
-    "hint": "值越大越不容易触发 B 站风控，但推送速度会变慢。\n推荐 1.0 ~ 3.0，默认 1.5。\n订阅数越多、越容易限流，就应该调得越大。"
+    "hint": "值越大越不容易触发 B 站风控，但推送速度会变慢。\n推荐 1.0 ~ 3.0，默认 1.5。"
   },
   "max_concurrent_checks": {
     "description": "同时检查的订阅数上限",
     "type": "int",
     "default": 2,
     "slider": { "min": 1, "max": 5, "step": 1 },
-    "hint": "设为 1 表示完全串行（最安全但最慢），2~3 兼顾速度和安全。\n配合上面的\"请求最小间隔\"一起使用。"
+    "hint": "设为 1 表示完全串行（最安全但最慢），2~3 兼顾速度和安全。"
   },
   "max_items_per_push": {
     "description": "单账号单次最多推送条数",
     "type": "int",
     "default": 5,
     "slider": { "min": 1, "max": 10, "step": 1 }
+  },
+  "video_quality": {
+    "description": "视频下载清晰度",
+    "type": "string",
+    "default": "32",
+    "options": ["16", "32", "64", "80", "112", "120"],
+    "labels": [
+      "360P 流畅（体积最小）",
+      "480P 清晰（默认，推荐）",
+      "720P 高清",
+      "1080P 高清",
+      "1080P+ 高码率（需大会员）",
+      "4K 超清（需大会员）"
+    ],
+    "hint": "选择视频下载使用的清晰度。\n清晰度越高，文件越大，下载和发送越慢，\n也越容易被机器人平台的大小上限拦截（超限会降级为卡片）。\n\n注意：实际可用清晰度受 B 站账号权限影响。\n未登录或非大会员账号可能拿不到 1080P 以上的流，\n此时插件会自动选择不超过所选档位的最高可用画质。"
+  },
+  "max_video_send_mb": {
+    "description": "视频下载预算（MB），超过则降级为卡片",
+    "type": "int",
+    "default": 50,
+    "slider": { "min": 0, "max": 500, "step": 10 },
+    "hint": "0 表示不限制（底层硬上限：DASH 470MB 视频轨 + 30MB 音频轨，\nprogressive 流 500MB）。\n\n预算在下载开始前通过 HTTP Content-Length 提前判断；\n部分 CDN 走 chunked 编码不带 Content-Length 时，\n靠下载过程中的流式检查兜底。超预算的流不会下载完整再丢弃。\n\n预算分配（动态）：\n· 视频轨先下，用 max_total − 1MB 作为上限\n· 下完后按实际大小决定音频轨预算：\n  min(30MB, max_total − 视频实际大小)\n· 音频剩余不足 1MB 时放弃音频，整个视频降级为卡片\n\n建议按机器人平台调整：\n· QQ 普通群 100MB\n· QQ 会员群 500MB\n· Telegram Bot 50MB\n· 微信 25MB\n· 不确定就用默认 50MB。"
   },
   "image_font_path": {
     "description": "渲染图片字体路径（可选，留空自动探测）",
@@ -94,5 +127,22 @@
     "description": "屏蔽空动态（既无文字也无图片）",
     "type": "bool",
     "default": true
+  },
+  "quiet_hours_enabled": {
+    "description": "开启静音时段（时段内暂停检查，结束后自动补推）",
+    "type": "bool",
+    "default": false,
+    "hint": "例如晚上睡觉不想被推送打扰，可以设置 23:00 - 07:00 静音；\n期间完全不发网络请求，结束后的第一次检查会把期间的新内容推送出来。"
+  },
+  "quiet_start": {
+    "description": "静音开始时间（HH:MM）",
+    "type": "string",
+    "default": "23:00"
+  },
+  "quiet_end": {
+    "description": "静音结束时间（HH:MM）",
+    "type": "string",
+    "default": "07:00",
+    "hint": "支持跨零点（如 23:00 - 07:00）。两个时间相同时视为关闭。"
   }
 }

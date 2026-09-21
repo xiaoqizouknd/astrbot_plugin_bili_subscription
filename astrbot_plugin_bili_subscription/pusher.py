@@ -3,10 +3,15 @@
 策略：
 - 首次检查某账号时只记录"当前最新"，不推送。
 - 之后每次发现新条目，从旧到新推送，状态推进到"最后一条成功的条目"。
-- 单条目连续失败超过 max_retries 次会被跳过，避免坏条目阻塞后续。
+- 上次推送的条目若已滑出最近列表，推送列表内全部新条目（而不是只推最新一条），
+  避免中间条目永久丢失。
+- 单条目连续失败超过 max_retries 次会被跳过，避免坏条目阻塞后续；
+  整轮检查失败（如网络故障）2 分钟后快速重试，而不是等满整个间隔。
+- 每个 UID 一把互斥锁：手动"订阅检查"与后台轮询重叠时不会重复推送。
 - 多个订阅限并发检查（默认 2），防止大量请求同时打向 B 站。
 - 每轮 tick 前尝试刷新配置，用户改订阅后无需重启。
-- 每小时轻量检测一次 B 站登录态，失效时提醒用户重新登录。
+- 每小时轻量检测一次 B 站登录态；每天刷新一次 bili_ticket 维持 Cookie 指纹。
+- 支持静音时段：时段内暂停一切网络请求，结束后自动补推。
 """
 
 from __future__ import annotations
@@ -25,7 +30,7 @@ from .bili_api import (
     UserDynamic,
     UserVideo,
 )
-from .render import render_card
+from .render import render_card, render_dynamic_card
 from .subscription import Subscription, SubscriptionStateStore
 
 
@@ -34,6 +39,13 @@ BuildDynamicChain = Callable[[bytes | None, list[bytes]], Any]
 SendVideoToSessions = Callable[[tuple[str, ...], UserVideo], Awaitable[bool]]
 ConfigRefresher = Callable[[], None]
 SendOne = Callable[[Any], Awaitable[bool]]
+
+# 失败计数字典的容量上限；超过时清理最早的一半
+_FAIL_COUNT_MAX_KEYS = 500
+# 整轮检查失败后的快速重试间隔（秒）
+_FAIL_RETRY_SECONDS = 120
+# bili_ticket 刷新间隔（秒）：约 3 天有效，每天刷一次
+_TICKET_REFRESH_SECONDS = 86400
 
 
 def is_empty_dynamic(dynamic: UserDynamic) -> bool:
@@ -65,6 +77,9 @@ class SubscriptionPusher:
         max_retries: int = 3,
         config_refresher: ConfigRefresher | None = None,
         max_concurrent_checks: int = 2,
+        quiet_enabled: bool = False,
+        quiet_start_minutes: int | None = None,
+        quiet_end_minutes: int | None = None,
     ) -> None:
         self._client = client
         self._store = store
@@ -80,11 +95,21 @@ class SubscriptionPusher:
         self._max_retries = max(1, max_retries)
         self._config_refresher = config_refresher
 
+        # 静音时段（分钟数，从 0 点起算）
+        self._quiet_enabled = quiet_enabled
+        self._quiet_start = quiet_start_minutes
+        self._quiet_end = quiet_end_minutes
+        self._quiet_logged = False
+
         # 限并发：防止同一时刻大量请求打向 B 站
         self._check_semaphore = asyncio.Semaphore(max(1, max_concurrent_checks))
 
-        # 每小时检测一次登录态
+        # 每个 UID 一把锁：手动"订阅检查"与后台轮询重叠时不会重复推送
+        self._uid_locks: dict[str, asyncio.Lock] = {}
+
+        # 每小时检测一次登录态；每天刷新一次 bili_ticket
         self._last_login_check = 0.0
+        self._last_ticket_refresh = 0.0
 
         self._subscriptions: list[Subscription] = []
         self._last_check: dict[str, float] = {}
@@ -92,11 +117,36 @@ class SubscriptionPusher:
         self._stop = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
 
+    def _uid_lock(self, uid: str) -> asyncio.Lock:
+        lock = self._uid_locks.get(uid)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._uid_locks[uid] = lock
+        return lock
+
+    def _in_quiet_time(self) -> bool:
+        """当前是否处于静音时段（支持跨零点，如 23:00-07:00）。"""
+        if not self._quiet_enabled or self._quiet_start is None or self._quiet_end is None:
+            return False
+        start, end = self._quiet_start, self._quiet_end
+        if start == end:
+            return False
+        now = time.localtime()
+        now_minutes = now.tm_hour * 60 + now.tm_min
+        if start < end:
+            return start <= now_minutes < end
+        return now_minutes >= start or now_minutes < end
+
     # ------------------------------------------------------------------
     # 外部接口
     # ------------------------------------------------------------------
     def update_subscriptions(self, subs: list[Subscription]) -> None:
         self._subscriptions = list(subs)
+        # 清理已删除 UID 的检查时间戳，避免字典无限增长
+        valid_uids = {s.uid for s in subs}
+        self._last_check = {
+            uid: ts for uid, ts in self._last_check.items() if uid in valid_uids
+        }
 
     def update_options(
         self,
@@ -107,6 +157,9 @@ class SubscriptionPusher:
         max_items_per_push: int,
         scan_interval_seconds: int,
         font_path: str | None,
+        quiet_enabled: bool = False,
+        quiet_start_minutes: int | None = None,
+        quiet_end_minutes: int | None = None,
     ) -> None:
         """热重载除订阅列表之外的开关，无需重启插件。"""
         self._enable_video_push = enable_video_push
@@ -115,6 +168,9 @@ class SubscriptionPusher:
         self._max_items = max(1, max_items_per_push)
         self._scan_interval = max(10, scan_interval_seconds)
         self._font_path = font_path
+        self._quiet_enabled = quiet_enabled
+        self._quiet_start = quiet_start_minutes
+        self._quiet_end = quiet_end_minutes
 
     def start(self) -> None:
         if self._task is None or self._task.done():
@@ -134,10 +190,17 @@ class SubscriptionPusher:
         self._task = None
 
     async def force_check(self) -> list[str]:
+        """立即执行一次完整检查。
+
+        与后台 tick 不同，这里对每个订阅强制检查所有已配置类型，
+        即使 ``enable_video_push=False`` 也会拉一次视频接口，
+        以便"订阅检查"能反映真实抓取情况。
+        """
         report: list[str] = []
         for sub in self._subscriptions:
             report.append(f"== UID {sub.uid} ==")
-            errors = await self._check(sub)
+            async with self._uid_lock(sub.uid):
+                errors = await self._check(sub, force_all=True)
             report.extend(f"   {e}" for e in errors)
         await self._safe_save()
         report.append("已完成一次立即检查。首次运行只记录当前最新，不推送。")
@@ -207,7 +270,8 @@ class SubscriptionPusher:
     # ------------------------------------------------------------------
     async def _run(self) -> None:
         try:
-            await asyncio.sleep(20)
+            # 启动后稍等片刻再进入轮询，让 AstrBot 各适配器完成加载
+            await asyncio.sleep(10)
         except asyncio.CancelledError:
             return
         while not self._stop.is_set():
@@ -230,15 +294,34 @@ class SubscriptionPusher:
             except Exception:
                 logger.exception("bili-subscription 刷新配置失败")
 
+        now = time.monotonic()
+
+        # 静音时段：暂停一切网络请求与推送，结束后下一轮自动补推
+        if self._in_quiet_time():
+            if not self._quiet_logged:
+                self._quiet_logged = True
+                logger.info("bili-subscription 进入静音时段，暂停检查")
+            return
+        if self._quiet_logged:
+            self._quiet_logged = False
+            logger.info("bili-subscription 静音时段结束，恢复检查")
+
+        # 每天刷新一次 bili_ticket，维持 Cookie 指纹新鲜度
+        if now - self._last_ticket_refresh >= _TICKET_REFRESH_SECONDS:
+            self._last_ticket_refresh = now
+            try:
+                await self._client.refresh_bili_ticket()
+            except Exception:
+                logger.exception("bili-subscription 刷新 bili_ticket 失败")
+
         # 每小时轻量检测一次登录态
-        if time.monotonic() - self._last_login_check > 3600:
-            self._last_login_check = time.monotonic()
+        if now - self._last_login_check > 3600:
+            self._last_login_check = now
             try:
                 await self._client.check_login()
             except Exception:
                 logger.exception("bili-subscription 登录态检测异常")
 
-        now = time.monotonic()
         due: list[Subscription] = []
         for sub in self._subscriptions:
             last = self._last_check.get(sub.uid, 0.0)
@@ -253,14 +336,24 @@ class SubscriptionPusher:
         await asyncio.gather(
             *(self._safe_check(sub) for sub in due), return_exceptions=True
         )
-        await self._safe_save()
 
     async def _safe_check(self, sub: Subscription) -> None:
         async with self._check_semaphore:
-            try:
-                await self._check(sub)
-            except Exception:
-                logger.exception("bili-subscription 检查 UID %s 失败", sub.uid)
+            async with self._uid_lock(sub.uid):
+                try:
+                    await self._check(sub)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.exception("bili-subscription 检查 UID %s 失败", sub.uid)
+                    # 网络故障等整轮失败：2 分钟后快速重试，而不是等满间隔
+                    self._last_check[sub.uid] = (
+                        time.monotonic() - sub.interval_minutes * 60
+                        + _FAIL_RETRY_SECONDS
+                    )
+                    return
+            # 每个订阅检查完立刻落盘，崩溃时最多丢一个订阅的进度
+            await self._safe_save()
 
     async def _safe_save(self) -> None:
         try:
@@ -268,14 +361,19 @@ class SubscriptionPusher:
         except Exception:
             logger.exception("bili-subscription 保存状态失败")
 
-    async def _check(self, sub: Subscription) -> list[str]:
+    async def _check(
+        self, sub: Subscription, *, force_all: bool = False
+    ) -> list[str]:
         """检查一个订阅。每类内容独立 try，返回错误消息列表。
+
+        ``force_all=True`` 时无视 ``enable_video_push`` 开关，
+        强制执行视频检查（供 ``订阅检查`` 命令使用）。
 
         返回值用于 ``订阅检查`` 命令展示，不抛异常。
         """
         errors: list[str] = []
 
-        if "video" in sub.types and self._enable_video_push:
+        if "video" in sub.types and (self._enable_video_push or force_all):
             try:
                 await self._check_videos(sub)
             except Exception as exc:
@@ -347,23 +445,16 @@ class SubscriptionPusher:
 
         new_items, found = self._collect_new(items, last, kind)
 
-        # last 不在最近列表中：保守只推最新一条（也要检查失败上限）
-        if not found:
-            fallback = items[0]
-            fallback_id = self._id_of(fallback, kind)
-            if self._too_many_failures(kind, fallback_id):
-                logger.warning(
-                    "UID %s %s 最新条目 %s 已达失败上限，跳过本轮",
-                    sub.uid, kind, fallback_id,
-                )
-                return
+        # last 不在最近列表中：说明列表内条目都比 last 新（抓取按时间倒序），
+        # 全部推送，而不是只推最新一条——否则中间条目会永久丢失。
+        if not found and new_items:
             logger.warning(
-                "UID %s %s 上次 %s 不在最近列表中，保守只推最新一条",
-                sub.uid, kind, last,
+                "UID %s %s 上次 %s 不在最近列表中，"
+                "将推送列表内全部 %d 条新条目",
+                sub.uid, kind, last, len(new_items),
             )
-            new_items = [fallback]
 
-        # 没有新条目：如果 newest 变了，说明都被过滤了，推进状态避免卡死
+        # 没有新条目（可能全部被失败上限过滤）：若 newest 变了，推进状态避免卡死
         if not new_items:
             if newest_id != last:
                 logger.warning(
@@ -437,6 +528,20 @@ class SubscriptionPusher:
                 "%s %s 连续失败 %d 次，将跳过后续重试",
                 kind, item_id, count,
             )
+        # 容量保护：字典超大时清理最早的一半
+        if len(self._fail_counts) > _FAIL_COUNT_MAX_KEYS:
+            self._prune_fail_counts()
+
+    def _prune_fail_counts(self) -> None:
+        """保留最近插入的一半键，其余丢弃。
+
+        Python 3.7+ 的 dict 保持插入顺序，keys()[:n] 就是最早的 n 个。
+        """
+        excess = len(self._fail_counts) - _FAIL_COUNT_MAX_KEYS // 2
+        if excess <= 0:
+            return
+        for key in list(self._fail_counts.keys())[:excess]:
+            self._fail_counts.pop(key, None)
 
     # ------------------------------------------------------------------
     # 干跑辅助
@@ -506,9 +611,28 @@ class SubscriptionPusher:
     async def _push_dynamic(
         self, sub: Subscription, dynamic: UserDynamic
     ) -> bool:
+        # 正文为空的动态：先尝试 detail 接口兜底一次（按需，不浪费请求）
+        if not dynamic.text and dynamic.may_need_detail:
+            try:
+                dynamic = await self._client.enrich_dynamic(dynamic)
+            except Exception:
+                logger.exception(
+                    "bili-subscription 动态正文兜底失败：%s", dynamic.dynamic_id
+                )
+
         image_bytes = await self._download_images(dynamic.image_urls)
-        card = await render_card(
-            title="B 站动态更新",
+        # 顺带下载头像，用于新卡片头部（失败不影响主流程）
+        avatar_bytes: bytes | None = None
+        if dynamic.author_face:
+            avatar_bytes = await self._client.download_image(
+                dynamic.author_face, max_bytes=2 * 1024 * 1024
+            )
+
+        card = await render_dynamic_card(
+            author_name=dynamic.author_name,
+            author_face=avatar_bytes,
+            kind_cn=dynamic.kind_cn,
+            timestamp=dynamic.created_at,
             body=dynamic.text or "（无文字内容）",
             images=image_bytes,
             footer=f"https://t.bilibili.com/{dynamic.dynamic_id}",
@@ -552,10 +676,12 @@ class SubscriptionPusher:
             )
             return False
 
+        # 消息链只构建一次：图片压缩/编码很耗 CPU，多个会话共用同一份
+        chain = self._build_dynamic_chain(card, image_bytes)
+
         all_ok = True
         for session_id in sessions:
             try:
-                chain = self._build_dynamic_chain(card, image_bytes)
                 ok = await self._send(session_id, chain)
                 if not ok:
                     all_ok = False
@@ -567,9 +693,18 @@ class SubscriptionPusher:
         return all_ok
 
     async def _download_images(self, urls: tuple[str, ...]) -> list[bytes]:
-        result: list[bytes] = []
-        for url in urls[:6]:
-            data = await self._client.download_image(url)
-            if data:
-                result.append(data)
-        return result
+        """并发下载所有图片。
+
+        download_image 内部有 Semaphore(2) 限制实际并发上限，
+        这里用 gather 并发发起，避免顺序等待浪费时间。
+        保持顺序：结果与 urls 的顺序一致（过滤掉失败项）。
+        """
+        if not urls:
+            return []
+        tasks = [self._client.download_image(u) for u in urls[:6]]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        out: list[bytes] = []
+        for r in results:
+            if isinstance(r, bytes) and r:
+                out.append(r)
+        return out
