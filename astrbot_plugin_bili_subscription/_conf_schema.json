@@ -105,7 +105,8 @@
   "image_font_path": {
     "description": "渲染图片字体路径（可选，留空自动探测）",
     "type": "string",
-    "default": ""
+    "default": "",
+    "hint": "留空时自动按「中文 → 韩文(malgun) → 日文(YuGoth/Meiryo) → emoji(Segoe UI Emoji)」的顺序\n探测系统字体；缺失的字形会自动回退到下一款字体，韩文/日文/emoji 不再显示方块，\n正常情况下无需设置。\n若个别字符仍显示方块，可指定一款全量字体的路径\n（如思源黑体 SourceHanSans / Noto Sans CJK / Sarasa Gothic 的 .ttf 或 .ttc）。"
   },
   "enable_video_push": {
     "description": "是否推送视频",

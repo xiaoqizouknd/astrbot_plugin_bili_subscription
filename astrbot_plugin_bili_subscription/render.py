@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import functools
 import io
+import re
 from datetime import datetime
 from pathlib import Path
 
@@ -35,6 +36,7 @@ except ModuleNotFoundError:
     _PIL_AVAILABLE = False
 
 
+# 主字体（中文优先）
 _FONT_CANDIDATES = (
     "C:/Windows/Fonts/msyh.ttc",
     "C:/Windows/Fonts/simhei.ttf",
@@ -44,6 +46,44 @@ _FONT_CANDIDATES = (
     "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
     "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
 )
+
+# 韩文回退字体（存在才加载；主字体缺韩文字形时自动接管）
+_HANGUL_FONT_CANDIDATES = (
+    "C:/Windows/Fonts/malgun.ttf",
+    "/System/Library/Fonts/AppleSDGothicNeo.ttc",
+    "/usr/share/fonts/truetype/nanum/NanumGothic.ttf",
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+    "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+)
+
+# 日文回退字体（存在才加载；主字体缺假名字形时自动接管）
+_KANA_FONT_CANDIDATES = (
+    "C:/Windows/Fonts/YuGothM.ttc",
+    "C:/Windows/Fonts/meiryo.ttc",
+    "C:/Windows/Fonts/msgothic.ttc",
+    "/System/Library/Fonts/Hiragino Sans GB.ttc",
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+    "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+)
+
+# emoji/符号回退字体（PIL 会渲染成单色轮廓，存在才加载）
+_EMOJI_FONT_CANDIDATES = (
+    "C:/Windows/Fonts/seguiemj.ttf",
+    "/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf",
+)
+
+# 字体栈最多加载的字体数量（控制启动与渲染开销）
+_FONT_STACK_MAX = 8
+
+# 扫描系统字体目录时，视为"可能支持韩/日文"的文件名特征
+_EXTRA_FONT_PATTERN = re.compile(
+    r"malgun|gulim|batang|dotum|gungsuh|nanum|yugoth|meiryo|msgothic|msmincho"
+    r"|noto|sourcehan|source-han|sarasa|unifont|wqy|korean|japanese"
+)
+
+# 用于探测字体 .notdef 字形的非字符（几乎所有字体都没有）
+_MISSING_CHAR = "\U0010FFFF"
+_notdef_bbox_cache: dict[int, tuple] = {}
 
 _CARD_WIDTH = 720
 _PADDING = 24
@@ -91,25 +131,135 @@ def _normalize_font_path(raw: str | None) -> str | None:
     return p or None
 
 
-@functools.lru_cache(maxsize=32)
-def _load_font_cached(size: int, custom: str | None):
-    candidates: list[str] = []
-    normalized = _normalize_font_path(custom)
-    if normalized:
-        candidates.append(normalized)
-    candidates.extend(_FONT_CANDIDATES)
+class _FontStack:
+    """多字体栈：主字体 + 韩文/日文/emoji 回退字体。
 
-    for path in candidates:
-        if path and Path(path).exists():
-            try:
-                return ImageFont.truetype(path, size)
-            except OSError:
-                continue
-    _warn_missing_font_once()
+    pick(ch) 选择第一个真正包含该字符字形的字体（通过与 .notdef 字形对比判定），
+    解决单一中文字体缺韩文/日文/emoji 字形时渲染成方框的问题。
+    """
+
+    __slots__ = ("fonts", "primary", "_pick_cache")
+
+    def __init__(self, fonts: tuple) -> None:
+        self.fonts = fonts
+        self.primary = fonts[0] if fonts else None
+        self._pick_cache: dict[str, object] = {}
+
+    def pick(self, ch: str):
+        if len(self.fonts) <= 1:
+            return self.primary
+        cached = self._pick_cache.get(ch)
+        if cached is not None:
+            return cached
+        chosen = self._pick_uncached(ch)
+        if len(self._pick_cache) >= 2048:
+            self._pick_cache.clear()
+        self._pick_cache[ch] = chosen
+        return chosen
+
+    def _pick_uncached(self, ch: str):
+        for font in self.fonts:
+            if _font_has_char(font, ch):
+                return font
+        return self.primary
+
+    def line_height(self) -> int:
+        heights = [_font_metrics_height(f) for f in self.fonts]
+        return max(heights, default=24)
+
+
+def _font_has_char(font, ch: str) -> bool:
+    """判断字体是否包含某字符。
+
+    字体缺失字符时 FreeType 渲染的是 .notdef 空框，其 bbox 与真实字形不同，
+    据此区分；异常时按"有字形"处理（回退到主字体绘制）。
+    """
+    if font is None or ch == _MISSING_CHAR:
+        return False
     try:
-        return ImageFont.load_default()
+        key = id(font)
+        notdef = _notdef_bbox_cache.get(key)
+        if notdef is None:
+            notdef = font.getbbox(_MISSING_CHAR)
+            _notdef_bbox_cache[key] = notdef
+        return font.getbbox(ch) != notdef
     except Exception:
-        return None
+        return True
+
+
+@functools.lru_cache(maxsize=1)
+def _scan_font_files() -> tuple[str, ...]:
+    """扫描系统字体目录里疑似支持韩文/日文/emoji 的字体文件。
+
+    跳过 Bold/Light 等变体（文件名以 bd/bold/b 结尾），
+    避免混排时部分字符比主字体明显加粗。
+    """
+    try:
+        font_dir = Path("C:/Windows/Fonts")
+        if not font_dir.is_dir():
+            return ()
+        results: list[str] = []
+        for path in font_dir.iterdir():
+            if path.suffix.casefold() not in (".ttf", ".ttc", ".otf"):
+                continue
+            stem = path.stem.casefold()
+            if re.search(r"(bd|bold|light|regular|-b|_b)$", stem):
+                continue
+            if _EXTRA_FONT_PATTERN.search(stem):
+                results.append(str(path))
+        results.sort()
+        return tuple(results)
+    except OSError:
+        return ()
+
+
+@functools.lru_cache(maxsize=32)
+def _load_font_stack(size: int, custom: str | None) -> _FontStack:
+    """加载主字体 + 韩/日/emoji 回退字体，组成字体栈（按字号缓存）。"""
+    normalized = _normalize_font_path(custom)
+    ordered: list[str] = []
+    seen: set[str] = set()
+
+    def add(path: str | None) -> None:
+        if not path:
+            return
+        key = path.casefold()
+        if key not in seen:
+            seen.add(key)
+            ordered.append(path)
+
+    add(normalized)
+    for path in _FONT_CANDIDATES:
+        add(path)
+    for path in _HANGUL_FONT_CANDIDATES:
+        add(path)
+    for path in _KANA_FONT_CANDIDATES:
+        add(path)
+    for path in _EMOJI_FONT_CANDIDATES:
+        add(path)
+    for path in _scan_font_files():
+        add(path)
+
+    fonts: list = []
+    for path in ordered:
+        if not Path(path).exists():
+            continue
+        try:
+            fonts.append(ImageFont.truetype(path, size))
+        except OSError:
+            continue
+        if len(fonts) >= _FONT_STACK_MAX:
+            break
+
+    if not fonts:
+        _warn_missing_font_once()
+        try:
+            default = ImageFont.load_default()
+        except Exception:
+            default = None
+        if default is not None:
+            fonts.append(default)
+    return _FontStack(tuple(fonts))
 
 
 def _normalize_text(raw: str) -> str:
@@ -170,22 +320,22 @@ def _render_sync(
     title: str, body: str, images: list[bytes],
     footer: str, font_path: str | None,
 ) -> bytes | None:
-    title_font = _load_font_cached(28, font_path)
-    body_font = _load_font_cached(20, font_path)
-    footer_font = _load_font_cached(14, font_path)
-    if title_font is None or body_font is None:
+    title_stack = _load_font_stack(28, font_path)
+    body_stack = _load_font_stack(20, font_path)
+    footer_stack = _load_font_stack(14, font_path)
+    if title_stack.primary is None or body_stack.primary is None:
         return None
 
-    line_height = _line_height(body_font)
-    title_height = _line_height(title_font) + 12
-    footer_height = _line_height(footer_font) + 12 if footer else 0
+    line_height = _line_height(body_stack)
+    title_height = _line_height(title_stack) + 12
+    footer_height = _line_height(footer_stack) + 12 if footer else 0
 
     max_text_width = _CARD_WIDTH - 2 * _PADDING
     normalized_body = _truncate_body(body)
 
     wrapped: list[str] = []
     for line in normalized_body.splitlines() or ["（无文字内容）"]:
-        wrapped.extend(_wrap_text(line, body_font, max_text_width))
+        wrapped.extend(_wrap_text(line, body_stack, max_text_width))
     body_height = len(wrapped) * line_height + 12
 
     fixed_height = _PADDING + title_height + body_height + footer_height + _PADDING
@@ -199,17 +349,17 @@ def _render_sync(
     draw = ImageDraw.Draw(canvas)
 
     y = _PADDING
-    draw.text((_PADDING, y), title, font=title_font, fill=_PRIMARY_TEXT)
+    _draw_text(draw, (_PADDING, y), title, title_stack, _PRIMARY_TEXT)
     y += title_height
     for line in wrapped:
-        draw.text((_PADDING, y), line, font=body_font, fill=_PRIMARY_TEXT)
+        _draw_text(draw, (_PADDING, y), line, body_stack, _PRIMARY_TEXT)
         y += line_height
     y += 12
     for img in scaled_images:
         canvas.paste(img, (_PADDING, y))
         y += img.height + 12
     if footer:
-        draw.text((_PADDING, y), footer, font=footer_font, fill=_SECONDARY_TEXT)
+        _draw_text(draw, (_PADDING, y), footer, footer_stack, _SECONDARY_TEXT)
 
     return _save_canvas(canvas, has_images=bool(scaled_images))
 
@@ -247,11 +397,11 @@ def _render_dynamic_sync(
     footer: str,
     font_path: str | None,
 ) -> bytes | None:
-    name_font = _load_font_cached(22, font_path)
-    meta_font = _load_font_cached(14, font_path)
-    body_font = _load_font_cached(20, font_path)
-    footer_font = _load_font_cached(14, font_path)
-    if name_font is None or body_font is None:
+    name_stack = _load_font_stack(22, font_path)
+    meta_stack = _load_font_stack(14, font_path)
+    body_stack = _load_font_stack(20, font_path)
+    footer_stack = _load_font_stack(14, font_path)
+    if name_stack.primary is None or body_stack.primary is None:
         return None
 
     avatar_size = 56
@@ -261,14 +411,14 @@ def _render_dynamic_sync(
 
     # ---- 正文换行 ----
     normalized_body = _truncate_body(body)
-    body_line_height = _line_height(body_font)
+    body_line_height = _line_height(body_stack)
     wrapped: list[str] = []
     for line in normalized_body.splitlines() or ["（无文字内容）"]:
-        wrapped.extend(_wrap_text(line, body_font, max_text_width))
+        wrapped.extend(_wrap_text(line, body_stack, max_text_width))
     body_height = len(wrapped) * body_line_height + 12
 
     # ---- 页脚 ----
-    footer_height = _line_height(footer_font) + 12 if footer else 0
+    footer_height = _line_height(footer_stack) + 12 if footer else 0
 
     # ---- 图片缩放（受卡片总高上限约束） ----
     fixed_height = header_height + body_height + footer_height + _PADDING
@@ -296,11 +446,9 @@ def _render_dynamic_sync(
 
     text_x = avatar_x + avatar_size + 16
     name_y = avatar_y + 2
-    draw.text(
-        (text_x, name_y),
-        author_name or "未知作者",
-        font=name_font,
-        fill=_PRIMARY_TEXT,
+    _draw_text(
+        draw, (text_x, name_y), author_name or "未知作者",
+        name_stack, _PRIMARY_TEXT,
     )
 
     meta_parts: list[str] = []
@@ -311,8 +459,10 @@ def _render_dynamic_sync(
         meta_parts.append(time_str)
     meta_text = "  ·  ".join(meta_parts)
     if meta_text:
-        meta_y = name_y + _line_height(name_font) + 4
-        draw.text((text_x, meta_y), meta_text, font=meta_font, fill=_SECONDARY_TEXT)
+        meta_y = name_y + _line_height(name_stack) + 4
+        _draw_text(
+            draw, (text_x, meta_y), meta_text, meta_stack, _SECONDARY_TEXT
+        )
 
     # 头部分割线
     divider_y = header_height - 1
@@ -324,7 +474,7 @@ def _render_dynamic_sync(
     # ---- 正文 ----
     y = header_height
     for line in wrapped:
-        draw.text((_PADDING, y), line, font=body_font, fill=_PRIMARY_TEXT)
+        _draw_text(draw, (_PADDING, y), line, body_stack, _PRIMARY_TEXT)
         y += body_line_height
     y += 12
 
@@ -335,7 +485,7 @@ def _render_dynamic_sync(
 
     # ---- 页脚 ----
     if footer:
-        draw.text((_PADDING, y), footer, font=footer_font, fill=_SECONDARY_TEXT)
+        _draw_text(draw, (_PADDING, y), footer, footer_stack, _SECONDARY_TEXT)
 
     return _save_canvas(canvas, has_images=bool(scaled_images))
 
@@ -424,7 +574,7 @@ def _save_canvas(canvas: Image.Image, *, has_images: bool) -> bytes:
     return buf.getvalue()
 
 
-def _line_height(font) -> int:
+def _font_metrics_height(font) -> int:
     try:
         ascent, descent = font.getmetrics()
         return ascent + descent + 4
@@ -432,7 +582,47 @@ def _line_height(font) -> int:
         return 24
 
 
-def _wrap_text(text: str, font, max_width: int) -> list[str]:
+def _line_height(stack: _FontStack) -> int:
+    return stack.line_height()
+
+
+def _char_width(ch: str, stack: _FontStack) -> int:
+    try:
+        font = stack.pick(ch)
+        if font is None:
+            return 1
+        return max(1, int(font.getlength(ch)))
+    except Exception:
+        return max(1, len(ch) * 14)
+
+
+def _draw_text(draw, xy, text: str, stack: _FontStack, fill: str) -> None:
+    """按字体栈逐段绘制文本：同一字体的连续字符合并为一段。
+
+    这样韩文/日文/emoji 等字符会自动用对应回退字体渲染，不再出现方框。
+    """
+    if not text or stack.primary is None:
+        return
+    x, y = xy
+    current_font = None
+    run: list[str] = []
+    for ch in text:
+        picked = stack.pick(ch)
+        if picked is not current_font and run:
+            run_text = "".join(run)
+            draw.text((x, y), run_text, font=current_font, fill=fill)
+            try:
+                x += current_font.getlength(run_text)
+            except Exception:
+                x += len(run_text) * 14
+            run = []
+        current_font = picked
+        run.append(ch)
+    if run:
+        draw.text((x, y), "".join(run), font=current_font, fill=fill)
+
+
+def _wrap_text(text: str, stack: _FontStack, max_width: int) -> list[str]:
     if not text:
         return [""]
     if max_width < 1:
@@ -440,28 +630,24 @@ def _wrap_text(text: str, font, max_width: int) -> list[str]:
 
     lines: list[str] = []
     current = ""
+    current_width = 0
     for ch in text:
-        if _text_width(ch, font) > max_width:
+        char_width = _char_width(ch, stack)
+        if char_width > max_width:
+            # 单字符超宽（极端情况）：独占一行
             if current:
                 lines.append(current)
                 current = ""
+                current_width = 0
             lines.append(ch)
             continue
-        candidate = current + ch
-        if _text_width(candidate, font) <= max_width:
-            current = candidate
+        if current_width + char_width <= max_width:
+            current += ch
+            current_width += char_width
             continue
-        if current:
-            lines.append(current)
+        lines.append(current)
         current = ch
+        current_width = char_width
     if current:
         lines.append(current)
     return lines or [""]
-
-
-def _text_width(text: str, font) -> int:
-    try:
-        bbox = font.getbbox(text)
-        return max(1, bbox[2] - bbox[0])
-    except Exception:
-        return max(1, len(text) * 14)

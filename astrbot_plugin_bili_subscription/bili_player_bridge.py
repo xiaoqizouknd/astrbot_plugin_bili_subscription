@@ -64,13 +64,16 @@ def has_bilibili_login(bili_player_data_dir: Path) -> bool:
 class DownloadedVideo:
     """下载完成的视频。
 
-    page_count / page_title 用于向用户提示"这是多 P 视频，仅推送第 1 P"。
+    page_count / page_title 用于向用户提示"这是多 P 视频，仅推送第 1 P"；
+    title / uploader 是下载时拿到的权威标题与 UP 主名（比列表接口更完整）。
     _release 为 None 时 release() 是空操作（构造时未传入释放函数）。
     """
 
     path: Path
     page_count: int = 1
     page_title: str = ""
+    title: str = ""
+    uploader: str = ""
     _release: Callable[[], Awaitable[None]] | None = None
 
     async def release(self) -> None:
@@ -321,6 +324,8 @@ class BiliVideoDownloader:
                 path=output_path,
                 page_count=page_count,
                 page_title=page_title,
+                title=detail.title,
+                uploader=detail.uploader,
                 _release=_release,
             )
 

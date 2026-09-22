@@ -37,7 +37,7 @@ from .bili_player_bridge import (
     has_bilibili_login,
     read_bilibili_cookies,
 )
-from .pusher import SubscriptionPusher, is_empty_dynamic
+from .pusher import SubscriptionPusher, is_empty_dynamic, is_gif
 from .render import pil_available, render_dynamic_card
 from .subscription import (
     RuntimeSubStore,
@@ -242,17 +242,22 @@ def _format_video_caption(
     *,
     page_count: int = 1,
     page_title: str = "",
+    title: str | None = None,
+    uploader: str | None = None,
 ) -> str:
     """生成视频消息的文本头部。
 
     信息完整，用户不点链接也知道是谁发的。
+    title / uploader 可传入下载时拿到的权威值（覆盖列表接口的结果）。
     page_count > 1 时附加"多 P 视频仅推送第 1 P"提示。
     """
+    title_text = title or video.title
+    uploader_text = uploader or video.uploader
     lines: list[str] = [
-        f"【视频更新】{_clip(video.title or '（无标题）', 100)}"
+        f"【视频更新】{_clip(title_text or '（无标题）', 100)}"
     ]
-    if video.uploader:
-        lines.append(f"UP主：{_clip(video.uploader, 40)}")
+    if uploader_text:
+        lines.append(f"UP主：{_clip(uploader_text, 40)}")
     duration = _format_duration(video.duration_seconds)
     if duration:
         lines.append(f"时长：{duration}")
@@ -648,9 +653,15 @@ class BiliSubscriptionPlugin(Star):
     def _build_dynamic_chain(
         self, card_bytes: bytes | None, images: list[bytes]
     ) -> Any:
-        first_chain: MessageChain | None = None
-        if card_bytes:
-            first_chain = MessageChain([_image_from_bytes(card_bytes)])
+        """组装消息链。
+
+        - 卡片合成图打头（JPEG，动图在这里只显示第一帧）；
+        - 原图放进合并转发（聊天记录）：静态图压缩成 JPEG，
+          GIF 动图用原图字节发送以保留动画。
+        """
+        first_chain = (
+            MessageChain([_image_from_bytes(card_bytes)]) if card_bytes else None
+        )
 
         forward_chain: MessageChain | None = None
         if (
@@ -661,12 +672,15 @@ class BiliSubscriptionPlugin(Star):
         ):
             nodes: list[Any] = []
             for index, img in enumerate(images[:6], start=1):
+                if is_gif(img):
+                    label = f"动图 {index}"
+                    component = _image_from_bytes(img)  # 原样，保留动画
+                else:
+                    label = f"原图 {index}"
+                    component = _image_from_bytes_compressed(img)
                 nodes.append(
                     Node(
-                        content=[
-                            Plain(f"原图 {index}"),
-                            _image_from_bytes_compressed(img),
-                        ],
+                        content=[Plain(label), component],
                         name="B站更新", uin="10000",
                     )
                 )
@@ -680,8 +694,8 @@ class BiliSubscriptionPlugin(Star):
     # ------------------------------------------------------------------
     async def _send_video_to_sessions(
         self, sessions: tuple[str, ...], video: UserVideo
-    ) -> bool:
-        """下载视频并发送。
+    ) -> set[str]:
+        """下载视频并发送，返回成功送达的会话集合。
 
         以下情况降级为"视频卡片"：
         ① 下载器不可用（没装 ffmpeg）；
@@ -746,20 +760,28 @@ class BiliSubscriptionPlugin(Star):
                 video,
                 page_count=downloaded.page_count,
                 page_title=downloaded.page_title,
+                title=downloaded.title,
+                uploader=downloaded.uploader,
             )
-            all_ok = True
+            delivered: set[str] = set()
             for session_id in sessions:
                 try:
+                    # 先发文字说明（标题/作者/链接），再发视频文件，
+                    # 避免部分平台把文字和视频塞在同一条消息里时丢掉文字
+                    await self.context.send_message(
+                        session_id, MessageChain([Plain(caption)])
+                    )
                     component = Video.fromFileSystem(str(downloaded.path))
-                    chain = MessageChain([Plain(caption), component])
-                    await self.context.send_message(session_id, chain)
+                    await self.context.send_message(
+                        session_id, MessageChain([component])
+                    )
+                    delivered.add(session_id)
                 except Exception:
                     logger.exception(
                         "bili-subscription 发送视频 %s 到 %s 失败",
                         video.bvid, session_id,
                     )
-                    all_ok = False
-            return all_ok
+            return delivered
         finally:
             try:
                 await downloaded.release()
@@ -768,8 +790,11 @@ class BiliSubscriptionPlugin(Star):
 
     async def _send_video_fallback(
         self, sessions: tuple[str, ...], video: UserVideo, *, reason: str
-    ) -> bool:
-        """视频无法发送时的降级：推送一张含封面、标题、UP 主、链接的卡片。"""
+    ) -> set[str]:
+        """视频无法发送时的降级：推送一张含封面、标题、UP 主、链接的卡片。
+
+        返回成功送达的会话集合。
+        """
         # 下载封面
         cover_bytes: bytes | None = None
         if video.cover and self._client is not None:
@@ -803,32 +828,32 @@ class BiliSubscriptionPlugin(Star):
         # Pillow 不可用 → 退化为纯文本
         if card is None:
             text = _format_video_caption(video) + f"\n（{reason}）"
-            all_ok = True
+            delivered: set[str] = set()
             for session_id in sessions:
                 try:
                     await self.context.send_message(
                         session_id, MessageChain([Plain(text)])
                     )
+                    delivered.add(session_id)
                 except Exception:
                     logger.exception(
                         "bili-subscription 发送视频卡片（纯文本）到 %s 失败", session_id
                     )
-                    all_ok = False
-            return all_ok
+            return delivered
 
         # 正常发送卡片
-        all_ok = True
+        delivered = set()
         for session_id in sessions:
             try:
                 await self.context.send_message(
                     session_id, MessageChain([_image_from_bytes(card)])
                 )
+                delivered.add(session_id)
             except Exception:
                 logger.exception(
                     "bili-subscription 发送视频卡片到 %s 失败", session_id
                 )
-                all_ok = False
-        return all_ok
+        return delivered
 
     # ------------------------------------------------------------------
     # 命令：订阅 / 退订（聊天内管理订阅，无需进 WebUI）

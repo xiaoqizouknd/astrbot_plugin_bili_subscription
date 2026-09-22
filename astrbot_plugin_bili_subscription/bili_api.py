@@ -32,6 +32,7 @@ import hashlib
 import hmac
 import json
 import random
+import re
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -51,6 +52,7 @@ _DYNAMIC_URL = f"{API_ORIGIN}/x/polymer/web-dynamic/v1/feed/space"
 _DYNAMIC_DETAIL_URL = f"{API_ORIGIN}/x/polymer/web-dynamic/v1/detail"
 _VIDEO_LIST_URL = f"{API_ORIGIN}/x/space/wbi/arc/search"
 _ARTICLE_URL = f"{API_ORIGIN}/x/space/wbi/article"
+_ARTICLE_VIEW_URL = f"{API_ORIGIN}/x/article/view"
 _VIEW_URL = f"{API_ORIGIN}/x/web-interface/wbi/view"
 _PLAY_URL = f"{API_ORIGIN}/x/player/wbi/playurl"
 
@@ -81,6 +83,14 @@ _IMAGE_MAX_BYTES = 8 * 1024 * 1024
 
 # 让 feed 接口返回 opus 正文所必需的业务参数
 _DYNAMIC_FEATURES = "itemOpusStyle"
+
+# 专栏正文 HTML 里的插图（懒加载图 data-src 优先，src 兜底）
+_ARTICLE_IMG_DATA_SRC_RE = re.compile(
+    r'<img[^>]+?\bdata-src\s*=\s*["\']([^"\']+)["\']', re.IGNORECASE
+)
+_ARTICLE_IMG_SRC_RE = re.compile(
+    r'<img[^>]+?\bsrc\s*=\s*["\']([^"\']+)["\']', re.IGNORECASE
+)
 
 # 节流参数
 _DEFAULT_MIN_GAP = 1.5
@@ -386,18 +396,50 @@ class BiliSubscriptionClient:
             article_id = str(raw.get("id") or raw.get("cvid") or "").strip()
             if not article_id:
                 continue
-            covers = raw.get("image_urls") or []
-            cover_list = tuple(str(c) for c in covers if isinstance(c, str))
+            covers = list(_parse_article_covers(raw.get("image_urls")))
+            banner = str(raw.get("banner_url") or "").strip()
+            if banner and banner not in covers:
+                covers.append(banner)
             result.append(
                 UserArticle(
                     article_id=article_id,
                     title=str(raw.get("title") or "").strip(),
                     summary=str(raw.get("summary") or "").strip(),
-                    covers=cover_list[:3],
+                    covers=tuple(covers[:3]),
                     created_at=int(raw.get("publish_time") or 0),
                 )
             )
         return result
+
+    async def fetch_article_content_images(
+        self, article_id: str, *, limit: int = 6
+    ) -> tuple[str, ...]:
+        """抓取专栏正文里的插图 URL（供卡片配图），失败返回空元组。
+
+        只在新专栏需要推送时调用，避免无谓请求。
+        """
+        try:
+            data = await self._request(
+                _ARTICLE_VIEW_URL, {"id": article_id}, wbi=False
+            )
+        except BiliApiError as exc:
+            logger.debug("bili-api 专栏正文 %s 抓取失败：%s", article_id, exc)
+            return ()
+        content = data.get("content") if isinstance(data, dict) else None
+        if not isinstance(content, str) or not content:
+            return ()
+
+        urls: list[str] = []
+        seen: set[str] = set()
+        for regex in (_ARTICLE_IMG_DATA_SRC_RE, _ARTICLE_IMG_SRC_RE):
+            for match in regex.finditer(content):
+                candidate = match.group(1).strip()
+                if _is_usable_img_url(candidate) and candidate not in seen:
+                    seen.add(candidate)
+                    urls.append(candidate)
+                    if len(urls) >= limit:
+                        return tuple(urls)
+        return tuple(urls)
 
     async def fetch_dynamics(self, uid: str, *, limit: int = 5) -> list[UserDynamic]:
         # 关键点：
@@ -1040,6 +1082,37 @@ def _parse_duration(text: str) -> int:
     for p in parts:
         seconds = seconds * 60 + int(p)
     return seconds
+
+
+def _parse_article_covers(raw_covers: Any) -> tuple[str, ...]:
+    """解析专栏封面列表：兼容字符串与 {url: ...} 两种结构。"""
+    if not isinstance(raw_covers, list):
+        return ()
+    covers: list[str] = []
+    for item in raw_covers[:3]:
+        if isinstance(item, str):
+            url = item.strip()
+        elif isinstance(item, Mapping):
+            url = str(item.get("url") or "").strip()
+        else:
+            continue
+        if url:
+            covers.append(url)
+    return tuple(covers)
+
+
+def _is_usable_img_url(url: str) -> bool:
+    """过滤 data:/blob: 等不可下载的图片地址。"""
+    if not url:
+        return False
+    lowered = url.casefold()
+    if lowered.startswith(("data:", "blob:", "javascript:")):
+        return False
+    return (
+        url.startswith("http://")
+        or url.startswith("https://")
+        or url.startswith("//")
+    )
 
 
 def _append_image_url(target: list[str], raw: Any) -> None:

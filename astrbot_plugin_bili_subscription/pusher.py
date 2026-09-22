@@ -5,6 +5,8 @@
 - 之后每次发现新条目，从旧到新推送，状态推进到"最后一条成功的条目"。
 - 上次推送的条目若已滑出最近列表，推送列表内全部新条目（而不是只推最新一条），
   避免中间条目永久丢失。
+- 每个会话单独记录送达情况：部分会话失败时下一轮只补发失败的会话，
+  同一会话对同一条目最多收到一次，杜绝重复刷屏。
 - 单条目连续失败超过 max_retries 次会被跳过，避免坏条目阻塞后续；
   整轮检查失败（如网络故障）2 分钟后快速重试，而不是等满整个间隔。
 - 每个 UID 一把互斥锁：手动"订阅检查"与后台轮询重叠时不会重复推送。
@@ -36,12 +38,14 @@ from .subscription import Subscription, SubscriptionStateStore
 
 SendCallback = Callable[[str, Any], Awaitable[bool]]
 BuildDynamicChain = Callable[[bytes | None, list[bytes]], Any]
-SendVideoToSessions = Callable[[tuple[str, ...], UserVideo], Awaitable[bool]]
+SendVideoToSessions = Callable[[tuple[str, ...], UserVideo], Awaitable[set[str]]]
 ConfigRefresher = Callable[[], None]
-SendOne = Callable[[Any], Awaitable[bool]]
+SendOne = Callable[[Any, tuple[str, ...]], Awaitable[set[str]]]
 
 # 失败计数字典的容量上限；超过时清理最早的一半
 _FAIL_COUNT_MAX_KEYS = 500
+# 已送达会话字典的容量上限（键：(类型, 条目ID)）
+_DELIVERED_MAX_KEYS = 500
 # 整轮检查失败后的快速重试间隔（秒）
 _FAIL_RETRY_SECONDS = 120
 # bili_ticket 刷新间隔（秒）：约 3 天有效，每天刷一次
@@ -57,6 +61,17 @@ def is_empty_dynamic(dynamic: UserDynamic) -> bool:
     if dynamic.image_urls:
         return False
     return True
+
+
+_GIF_MAGIC = (b"GIF87a", b"GIF89a")
+
+
+def is_gif(data: bytes) -> bool:
+    """按文件头识别 GIF（不看 URL 后缀，防止被查询参数干扰）。
+
+    main.py 的消息构造也用它，把动图放进合并转发时保留原图动画。
+    """
+    return len(data) >= 6 and data[:6] in _GIF_MAGIC
 
 
 class SubscriptionPusher:
@@ -114,6 +129,8 @@ class SubscriptionPusher:
         self._subscriptions: list[Subscription] = []
         self._last_check: dict[str, float] = {}
         self._fail_counts: dict[tuple[str, str], int] = {}
+        # 已送达会话：(类型, 条目ID) -> 已收到的会话集合，用于"只补发失败会话"
+        self._delivered: dict[tuple[str, str], set[str]] = {}
         self._stop = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
 
@@ -224,8 +241,11 @@ class SubscriptionPusher:
                 sessions=(session_id,),
                 types=frozenset({"dynamic"}),
             )
-            if await self._push_dynamic(sub, dynamics[0]):
+            delivered = await self._push_dynamic(sub, dynamics[0], sub.sessions)
+            if delivered:
                 lines.append(f"已推送最新动态：{dynamics[0].dynamic_id}")
+                # 测试推送也推进状态，避免后台轮询把同一条再推一遍
+                await self._store.set(uid, "dynamic", dynamics[0].dynamic_id)
             else:
                 lines.append("动态推送失败")
         else:
@@ -243,8 +263,11 @@ class SubscriptionPusher:
                 sessions=(session_id,),
                 types=frozenset({"article"}),
             )
-            if await self._push_article(sub, articles[0]):
+            delivered = await self._push_article(sub, articles[0], sub.sessions)
+            if delivered:
                 lines.append(f"已推送最新专栏：{articles[0].article_id}")
+                # 同上：测试推送后推进状态，避免后台重复推送
+                await self._store.set(uid, "article", articles[0].article_id)
             else:
                 lines.append("专栏推送失败")
         else:
@@ -403,10 +426,7 @@ class SubscriptionPusher:
         videos = await self._client.fetch_videos(sub.uid, limit=self._max_items)
         if not videos:
             return
-        await self._process_items(
-            sub, videos, "video",
-            partial(self._send_video_to_sessions, sub.sessions),
-        )
+        await self._process_items(sub, videos, "video", self._send_video_one)
 
     async def _check_dynamics(self, sub: Subscription) -> None:
         dynamics = await self._client.fetch_dynamics(sub.uid, limit=self._max_items)
@@ -466,22 +486,35 @@ class SubscriptionPusher:
 
         logger.info("UID %s %s 发现新条目 %d 条", sub.uid, kind, len(new_items))
 
-        # 从旧到新推送，状态推进到最后一条成功的
+        # 从旧到新推送；每个会话只送达一次：
+        # 部分会话失败时，下一轮只补发失败的会话，已收到的会话不再重复。
         last_success_id: str | None = None
         for item in reversed(new_items):
             item_id = self._id_of(item, kind)
+            pending = self._pending_sessions(sub, kind, item_id)
+            if not pending:
+                # 所有会话都已送达（可能上一轮只补发了一部分）
+                self._note_success(kind, item_id)
+                last_success_id = item_id
+                continue
             try:
-                ok = await send_one(item)
+                delivered = await send_one(item, pending)
             except Exception:
                 logger.exception("推送 %s %s 异常", kind, item_id)
-                ok = False
-
-            if ok:
+                delivered = set()
+            delivered_set = set(delivered or ()) & set(pending)
+            if delivered_set:
+                self._mark_delivered(kind, item_id, delivered_set)
+            if set(pending) <= delivered_set:
                 self._note_success(kind, item_id)
                 last_success_id = item_id
             else:
                 self._note_failure(kind, item_id)
-                logger.warning("推送 %s %s 失败，稍后重试", kind, item_id)
+                missed = [s for s in pending if s not in delivered_set]
+                logger.warning(
+                    "推送 %s %s 部分失败，未送达会话 %s，稍后仅补发这些会话",
+                    kind, item_id, missed,
+                )
                 break  # 保持顺序：失败之后的条目不再推送
 
         if last_success_id is not None:
@@ -516,8 +549,28 @@ class SubscriptionPusher:
     def _too_many_failures(self, kind: str, item_id: str) -> bool:
         return self._fail_counts.get((kind, item_id), 0) >= self._max_retries
 
+    def _pending_sessions(
+        self, sub: Subscription, kind: str, item_id: str
+    ) -> tuple[str, ...]:
+        """该条目尚未送达的会话（已送达的会话跳过，保证每会话最多一次）。"""
+        delivered = self._delivered.get((kind, item_id), ())
+        return tuple(s for s in sub.sessions if s not in delivered)
+
+    def _mark_delivered(
+        self, kind: str, item_id: str, sessions: set[str] | tuple[str, ...]
+    ) -> None:
+        key = (kind, item_id)
+        bucket = self._delivered.setdefault(key, set())
+        bucket.update(sessions)
+        # 容量保护：字典超大时清理最早的一半
+        if len(self._delivered) > _DELIVERED_MAX_KEYS:
+            for old in list(self._delivered.keys())[:_DELIVERED_MAX_KEYS // 2]:
+                self._delivered.pop(old, None)
+
     def _note_success(self, kind: str, item_id: str) -> None:
         self._fail_counts.pop((kind, item_id), None)
+        # 条目已全部送达，送达记录不再需要
+        self._delivered.pop((kind, item_id), None)
 
     def _note_failure(self, kind: str, item_id: str) -> None:
         key = (kind, item_id)
@@ -596,21 +649,27 @@ class SubscriptionPusher:
     # ------------------------------------------------------------------
     # 推送动作
     # ------------------------------------------------------------------
+    async def _send_video_one(
+        self, video: UserVideo, sessions: tuple[str, ...]
+    ) -> set[str]:
+        """视频推送入口：返回成功送达的会话集合。"""
+        return await self._send_video_to_sessions(sessions, video)
+
     async def _send_dynamic_one(
-        self, sub: Subscription, dynamic: UserDynamic
-    ) -> bool:
-        """过滤 + 推送。返回 True 表示"已处理"（跳过也算处理）。"""
+        self, sub: Subscription, dynamic: UserDynamic, sessions: tuple[str, ...]
+    ) -> set[str]:
+        """过滤 + 推送。返回成功送达的会话集合（跳过视为全部送达）。"""
         if self._skip_video_dynamic and dynamic.is_original_video:
             logger.debug("跳过视频动态 %s", dynamic.dynamic_id)
-            return True
+            return set(sessions)
         if self._skip_empty_dynamic and is_empty_dynamic(dynamic):
             logger.debug("跳过空动态 %s", dynamic.dynamic_id)
-            return True
-        return await self._push_dynamic(sub, dynamic)
+            return set(sessions)
+        return await self._push_dynamic(sub, dynamic, sessions)
 
     async def _push_dynamic(
-        self, sub: Subscription, dynamic: UserDynamic
-    ) -> bool:
+        self, sub: Subscription, dynamic: UserDynamic, sessions: tuple[str, ...]
+    ) -> set[str]:
         # 正文为空的动态：先尝试 detail 接口兜底一次（按需，不浪费请求）
         if not dynamic.text and dynamic.may_need_detail:
             try:
@@ -639,14 +698,31 @@ class SubscriptionPusher:
             font_path=self._font_path,
         )
         return await self._broadcast(
-            sub.sessions, card, image_bytes,
+            sessions, card, image_bytes,
             content_id=dynamic.dynamic_id, kind="动态",
         )
 
     async def _push_article(
-        self, sub: Subscription, article: UserArticle
-    ) -> bool:
+        self, sub: Subscription, article: UserArticle, sessions: tuple[str, ...]
+    ) -> set[str]:
         image_bytes = await self._download_images(article.covers)
+        # 专栏正文里的插图也一并展示（封面之外最多再补 6 张）
+        remaining = 6 - len(image_bytes)
+        if remaining > 0:
+            try:
+                content_urls = await self._client.fetch_article_content_images(
+                    article.article_id, limit=remaining
+                )
+            except Exception as exc:
+                logger.warning(
+                    "bili-subscription 专栏 %s 正文插图抓取失败：%s",
+                    article.article_id, exc,
+                )
+                content_urls = ()
+            if content_urls:
+                image_bytes.extend(
+                    await self._download_images(content_urls[:remaining])
+                )
         body = f"{article.title}\n\n{article.summary}"
         card = await render_card(
             title="B 站专栏更新",
@@ -656,7 +732,7 @@ class SubscriptionPusher:
             font_path=self._font_path,
         )
         return await self._broadcast(
-            sub.sessions, card, image_bytes,
+            sessions, card, image_bytes,
             content_id=article.article_id, kind="专栏",
         )
 
@@ -668,29 +744,29 @@ class SubscriptionPusher:
         *,
         content_id: str,
         kind: str,
-    ) -> bool:
+    ) -> set[str]:
+        """把消息链发到各会话，返回成功送达的会话集合。"""
         if card is None and not image_bytes:
             logger.warning(
                 "%s %s 无任何可发送内容（Pillow 不可用且无图片）",
                 kind, content_id,
             )
-            return False
+            return set()
 
         # 消息链只构建一次：图片压缩/编码很耗 CPU，多个会话共用同一份
         chain = self._build_dynamic_chain(card, image_bytes)
 
-        all_ok = True
+        delivered: set[str] = set()
         for session_id in sessions:
             try:
                 ok = await self._send(session_id, chain)
-                if not ok:
-                    all_ok = False
+                if ok:
+                    delivered.add(session_id)
             except Exception:
                 logger.exception(
                     "推送%s %s 到 %s 失败", kind, content_id, session_id
                 )
-                all_ok = False
-        return all_ok
+        return delivered
 
     async def _download_images(self, urls: tuple[str, ...]) -> list[bytes]:
         """并发下载所有图片。
