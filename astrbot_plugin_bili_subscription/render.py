@@ -87,7 +87,10 @@ _notdef_bbox_cache: dict[int, tuple] = {}
 
 _CARD_WIDTH = 720
 _PADDING = 24
-_MAX_IMAGE_HEIGHT = 900
+# 单张图的最大高度：防止极端长图把卡片撑爆。
+# 一般长截图（如 1080×4000）缩到卡片宽 672 后约 2400 高，仍能完整清晰显示，
+# 而不是被压成 ~200px 宽的小条导致文字看不清。
+_MAX_IMAGE_HEIGHT = 3000
 
 # 整张卡片（含所有嵌入图）的字节上限
 _CARD_MAX_BYTES = 2 * 1024 * 1024

@@ -675,6 +675,9 @@ class BiliSubscriptionPlugin(Star):
                 if is_gif(img):
                     label = f"动图 {index}"
                     component = _image_from_bytes(img)  # 原样，保留动画
+                elif len(img) <= _FORWARD_IMAGE_MAX_BYTES:
+                    label = f"原图 {index}"
+                    component = _image_from_bytes(img)  # 原图直发，保证文字清晰可读
                 else:
                     label = f"原图 {index}"
                     component = _image_from_bytes_compressed(img)
@@ -1306,8 +1309,16 @@ def _event_str(event: AstrMessageEvent, method_name: str) -> str | None:
     return text or None
 
 
-def _compress_image(data: bytes, *, max_side: int = 1080, quality: int = 75) -> bytes:
-    """压缩图片，避免 base64 后过大导致合并转发发送失败。"""
+# 合并转发里单张原图超过该字节数才压缩（否则直接发原图，保证文字可读）
+_FORWARD_IMAGE_MAX_BYTES = 6 * 1024 * 1024
+
+
+def _compress_image(data: bytes, *, max_side: int = 1920, quality: int = 85) -> bytes:
+    """压缩超大图片，避免 base64 后过大导致合并转发发送失败。
+
+    只在图片超过 _FORWARD_IMAGE_MAX_BYTES 时才调用，属于兜底，
+    因此压缩参数更宽松（1920 边长 / 85 质量），尽量保住文字可读性。
+    """
     try:
         from PIL import Image
         _lanczos = getattr(Image, "Resampling", Image).LANCZOS
