@@ -129,6 +129,12 @@
     "type": "bool",
     "default": true
   },
+  "skip_forward_dynamic": {
+    "description": "屏蔽转发的动态（不推送别人转发的动态）",
+    "type": "bool",
+    "default": true,
+    "hint": "只推送 UP 主自己的动态，跳过 DYNAMIC_TYPE_FORWARD 转发动态。"
+  },
   "quiet_hours_enabled": {
     "description": "开启静音时段（时段内暂停检查，结束后自动补推）",
     "type": "bool",

@@ -2,14 +2,16 @@
 
 防风控策略（多层）：
 - 请求头补全（Origin / Accept-Language）；
-- 每个客户端实例固定一个随机 UA（避免同连接池多 UA 被关联风控），
-  遇到 -352 时有概率换一个新 UA；
+- 每个客户端实例全程固定一个随机 UA——UA 与 buvid Cookie 是一对稳定
+  指纹，真实浏览器不会中途换 UA，中途换反而制造"同设备多浏览器"矛盾；
 - 全局节流带随机 jitter，避免机械间隔；
-- 遇到 -352 时动态拉长节流间隔，连续 5 次成功才缓慢恢复；
+- 遇到风控时动态拉长节流间隔，连续 5 次成功才缓慢恢复；
 - -352 时强制刷新 WBI 密钥（密钥过期会伪装成风控）；
-- 图片下载独立 Semaphore 限并发；4xx 不重试、5xx 重试一次；
+- 风控熔断：连续多次风控错误后进入冷却期（默认 15 分钟），后台轮询
+  完全停止请求，冷却结束自动恢复，避免被封期间继续硬刚加重风控；
 - 指数退避重试（5s → 15s → 60s）；
-- Cookie 30 秒缓存 + bili_ticket 主动获取（在 main 中完成）。
+- 图片下载独立 Semaphore 限并发；4xx 不重试、5xx 重试一次；
+- Cookie 30 秒缓存 + bili_ticket 主动获取与每日续期。
 
 动态解析说明：
 B 站 feed 接口默认会把 opus 正文吞掉——必须同时满足两个条件才能拿到正文：
@@ -56,22 +58,25 @@ _ARTICLE_VIEW_URL = f"{API_ORIGIN}/x/article/view"
 _VIEW_URL = f"{API_ORIGIN}/x/web-interface/wbi/view"
 _PLAY_URL = f"{API_ORIGIN}/x/player/wbi/playurl"
 
-# UA 池：都是真实存在的浏览器版本
+# UA 池：都是真实存在的较新浏览器版本，避免老版本 UA 显得可疑
 _USER_AGENTS: tuple[str, ...] = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/124.0.0.0 Safari/537.36",
+    "Chrome/134.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/125.0.0.0 Safari/537.36",
+    "Chrome/133.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/135.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/124.0.0.0 Safari/537.36",
+    "Chrome/134.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/124.0.0.0 Safari/537.36 Edg/124.0.0.0",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) "
-    "Gecko/20100101 Firefox/125.0",
+    "Chrome/134.0.0.0 Safari/537.36 Edg/134.0.0.0",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:135.0) "
+    "Gecko/20100101 Firefox/135.0",
 )
 
 # 向后兼容：其他模块可能 import _USER_AGENT
@@ -97,7 +102,11 @@ _DEFAULT_MIN_GAP = 1.5
 _MIN_GAP_CEILING = 10.0     # 遇风控时拉长的上限
 _JITTER_MAX = 0.8
 _SPEED_UP_STREAK = 5        # 连续成功 N 次才恢复一档
-_UA_REROLL_PROBABILITY = 0.3  # 遇风控时换 UA 的概率
+
+# 风控熔断：连续多次风控错误后进入冷却期，后台完全停止请求
+_RISK_CONTROL_CODES = (-352, -412, -509, -799)
+_RISK_STREAK_THRESHOLD = 3
+_RISK_COOLDOWN_SECONDS = 15 * 60
 
 # 动态类型 → 中文标签（显示在卡片头部）
 _KIND_CN = {
@@ -329,8 +338,13 @@ class BiliSubscriptionClient:
         # 图片下载限并发
         self._image_semaphore = asyncio.Semaphore(2)
 
-        # 每个实例固定一个 UA；遇风控有概率换新
+        # 实例全程固定一个 UA：UA 与 buvid Cookie 是一对稳定指纹，
+        # 真实浏览器不会中途换 UA，中途换反而制造指纹矛盾
         self._ua = random.choice(_USER_AGENTS)
+
+        # 风控熔断状态
+        self._risk_streak = 0
+        self._cooldown_until = 0.0
 
         self._cred_cache: dict[str, str] = {}
         self._cred_expires = 0.0
@@ -417,9 +431,11 @@ class BiliSubscriptionClient:
         """抓取专栏正文里的插图 URL（供卡片配图），失败返回空元组。
 
         只在新专栏需要推送时调用，避免无谓请求。
+        该接口同样受风控影响，这里用带退避重试的请求，遇到 -352
+        会拉长节流并重试，尽量避免正文插图抓取失败。
         """
         try:
-            data = await self._request(
+            data = await self._request_with_backoff(
                 _ARTICLE_VIEW_URL, {"id": article_id}, wbi=False
             )
         except BiliApiError as exc:
@@ -431,14 +447,26 @@ class BiliSubscriptionClient:
 
         urls: list[str] = []
         seen: set[str] = set()
+
+        def _collect(candidate: str) -> bool:
+            candidate = _unescape_img_url(candidate)
+            if _is_usable_img_url(candidate) and candidate not in seen:
+                seen.add(candidate)
+                urls.append(candidate)
+            return len(urls) >= limit
+
+        # ① 接口直接返回的原图列表（最可靠，优先使用）
+        origin = data.get("origin_image_urls")
+        if isinstance(origin, list):
+            for item in origin:
+                if isinstance(item, str) and _collect(item):
+                    return tuple(urls)
+
+        # ② 从正文 HTML 里提取（懒加载 data-src 优先，src 兜底）
         for regex in (_ARTICLE_IMG_DATA_SRC_RE, _ARTICLE_IMG_SRC_RE):
             for match in regex.finditer(content):
-                candidate = match.group(1).strip()
-                if _is_usable_img_url(candidate) and candidate not in seen:
-                    seen.add(candidate)
-                    urls.append(candidate)
-                    if len(urls) >= limit:
-                        return tuple(urls)
+                if _collect(match.group(1)):
+                    return tuple(urls)
         return tuple(urls)
 
     async def fetch_dynamics(self, uid: str, *, limit: int = 5) -> list[UserDynamic]:
@@ -721,7 +749,11 @@ class BiliSubscriptionClient:
             self._last_request_ts = time.monotonic()
 
     def _slow_down(self) -> None:
-        """遇到风控时拉长节流间隔，并有概率换一个新 UA。"""
+        """遇到风控时拉长节流间隔。
+
+        不再中途更换 UA：UA 与 buvid Cookie 是一对稳定指纹，
+        换 UA 反而会制造"同一设备多个浏览器"的矛盾特征。
+        """
         self._success_streak = 0
         new_gap = min(self._min_gap * 1.5, _MIN_GAP_CEILING)
         if new_gap > self._min_gap:
@@ -730,8 +762,6 @@ class BiliSubscriptionClient:
                 self._min_gap, new_gap,
             )
             self._min_gap = new_gap
-        if random.random() < _UA_REROLL_PROBABILITY:
-            self._ua = random.choice(_USER_AGENTS)
 
     def _speed_up(self) -> None:
         """连续成功 N 次后才缓慢恢复节流间隔。"""
@@ -747,6 +777,36 @@ class BiliSubscriptionClient:
 
     def _pick_ua(self) -> str:
         return self._ua
+
+    def _note_risk_error(self) -> None:
+        """记录一次风控错误；连续多次后进入冷却期（熔断）。"""
+        self._risk_streak += 1
+        if self._risk_streak >= _RISK_STREAK_THRESHOLD:
+            self._risk_streak = 0
+            self._cooldown_until = time.monotonic() + _RISK_COOLDOWN_SECONDS
+            logger.warning(
+                "bili-api 连续遭遇风控，进入 %.0f 分钟冷却期，"
+                "期间后台轮询停止请求，冷却结束自动恢复",
+                _RISK_COOLDOWN_SECONDS / 60,
+            )
+
+    def in_cooldown(self) -> bool:
+        """是否处于风控冷却期（熔断中）。"""
+        return time.monotonic() < self._cooldown_until
+
+    def cooldown_remaining_seconds(self) -> int:
+        """冷却期剩余秒数；不在冷却期返回 0。"""
+        if not self.in_cooldown():
+            return 0
+        return int(self._cooldown_until - time.monotonic()) + 1
+
+    def current_min_gap(self) -> float:
+        """当前实际节流间隔（遭遇风控时会拉长）。"""
+        return self._min_gap
+
+    def base_min_gap(self) -> float:
+        """配置的基准节流间隔。"""
+        return self._base_min_gap
 
     async def _download_one(
         self, url: str, dest: Path, *,
@@ -910,16 +970,18 @@ class BiliSubscriptionClient:
         for attempt in range(max_attempts):
             try:
                 result = await self._request(url, params, wbi=wbi)
-                # 成功：计数 +1，达到阈值才恢复节流间隔
+                # 成功：重置风控计数 + 达到阈值才恢复节流间隔
+                self._risk_streak = 0
                 self._speed_up()
                 return result
             except BiliApiError as exc:
                 last_exc = exc
                 if exc.code not in _RETRYABLE_CODES:
                     raise
-                # 风控专属处理：拉长节流 + 强制刷新 WBI
-                if exc.code in (-352, -412, -509, -799):
+                # 风控专属处理：拉长节流 + 熔断计数 + 强制刷新 WBI
+                if exc.code in _RISK_CONTROL_CODES:
                     self._slow_down()
+                    self._note_risk_error()
                     if exc.code == -352:
                         # WBI 密钥可能已过期，强制下次重新获取
                         self._wbi_key = None
@@ -1112,6 +1174,16 @@ def _is_usable_img_url(url: str) -> bool:
         url.startswith("http://")
         or url.startswith("https://")
         or url.startswith("//")
+    )
+
+
+def _unescape_img_url(url: str) -> str:
+    """还原 URL 里的 HTML 实体（正文里的 &amp; 等），否则下载会 404。"""
+    return (
+        url.strip()
+        .replace("&amp;", "&")
+        .replace("&#38;", "&")
+        .replace("&#x26;", "&")
     )
 
 

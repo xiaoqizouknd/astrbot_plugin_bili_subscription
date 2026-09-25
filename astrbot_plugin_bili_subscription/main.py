@@ -357,6 +357,9 @@ class BiliSubscriptionPlugin(Star):
                     skip_empty_dynamic=bool(
                         self._config.get("skip_empty_dynamic", True)
                     ),
+                    skip_forward_dynamic=bool(
+                        self._config.get("skip_forward_dynamic", True)
+                    ),
                     max_items_per_push=int(
                         self._config.get("max_items_per_push") or 5
                     ),
@@ -566,6 +569,9 @@ class BiliSubscriptionPlugin(Star):
                 ),
                 skip_empty_dynamic=bool(
                     self._config.get("skip_empty_dynamic", True)
+                ),
+                skip_forward_dynamic=bool(
+                    self._config.get("skip_forward_dynamic", True)
                 ),
                 config_refresher=self._refresh_config_and_subs,
                 max_concurrent_checks=int(
@@ -1100,6 +1106,10 @@ class BiliSubscriptionPlugin(Star):
             "空动态过滤："
             f"{'已开启' if self._config.get('skip_empty_dynamic', True) else '已关闭'}"
         )
+        lines.append(
+            "转发动态过滤："
+            f"{'已开启' if self._config.get('skip_forward_dynamic', True) else '已关闭'}"
+        )
 
         runtime_count = (
             self._runtime_store.count if self._runtime_store is not None else 0
@@ -1113,6 +1123,20 @@ class BiliSubscriptionPlugin(Star):
             )
         else:
             lines.append("静音时段：未开启")
+
+        if self._client is not None:
+            if self._client.in_cooldown():
+                lines.append(
+                    "⚠️ 风控冷却中：剩余约 "
+                    f"{self._client.cooldown_remaining_seconds() // 60 + 1} 分钟，"
+                    "后台检查已暂停，冷却结束自动恢复"
+                )
+            lines.append(
+                "请求节流间隔：当前 "
+                f"{self._client.current_min_gap():.1f} 秒"
+                f"（基础 {self._client.base_min_gap():.1f} 秒，"
+                "遭遇风控时会自动拉长）"
+            )
 
         if not pil_available():
             lines.append("")
@@ -1208,6 +1232,17 @@ class BiliSubscriptionPlugin(Star):
         except Exception as exc:
             logger.exception("bili-subscription 测试推送失败")
             lines.append(f"推送异常：{exc}")
+
+        # 顺带测试视频推送（下载并发送最新视频）
+        try:
+            lines.extend(
+                await self._pusher.push_latest_video(
+                    uid, event.unified_msg_origin
+                )
+            )
+        except Exception as exc:
+            logger.exception("bili-subscription 测试推送视频失败")
+            lines.append(f"视频推送异常：{exc}")
 
         yield event.plain_result("\n".join(lines))
         event.stop_event()

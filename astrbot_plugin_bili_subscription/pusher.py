@@ -14,6 +14,8 @@
 - 每轮 tick 前尝试刷新配置，用户改订阅后无需重启。
 - 每小时轻量检测一次 B 站登录态；每天刷新一次 bili_ticket 维持 Cookie 指纹。
 - 支持静音时段：时段内暂停一切网络请求，结束后自动补推。
+- 风控熔断：客户端连续遭遇风控进入冷却期时，后台轮询自动暂停，
+  冷却结束自动恢复，避免被封期间继续请求加重风控。
 """
 
 from __future__ import annotations
@@ -89,6 +91,7 @@ class SubscriptionPusher:
         enable_video_push: bool = True,
         skip_video_dynamic: bool = True,
         skip_empty_dynamic: bool = True,
+        skip_forward_dynamic: bool = True,
         max_retries: int = 3,
         config_refresher: ConfigRefresher | None = None,
         max_concurrent_checks: int = 2,
@@ -107,6 +110,7 @@ class SubscriptionPusher:
         self._enable_video_push = enable_video_push
         self._skip_video_dynamic = skip_video_dynamic
         self._skip_empty_dynamic = skip_empty_dynamic
+        self._skip_forward_dynamic = skip_forward_dynamic
         self._max_retries = max(1, max_retries)
         self._config_refresher = config_refresher
 
@@ -115,6 +119,9 @@ class SubscriptionPusher:
         self._quiet_start = quiet_start_minutes
         self._quiet_end = quiet_end_minutes
         self._quiet_logged = False
+
+        # 风控冷却期日志去重标记
+        self._cooldown_logged = False
 
         # 限并发：防止同一时刻大量请求打向 B 站
         self._check_semaphore = asyncio.Semaphore(max(1, max_concurrent_checks))
@@ -171,6 +178,7 @@ class SubscriptionPusher:
         enable_video_push: bool,
         skip_video_dynamic: bool,
         skip_empty_dynamic: bool,
+        skip_forward_dynamic: bool = True,
         max_items_per_push: int,
         scan_interval_seconds: int,
         font_path: str | None,
@@ -182,6 +190,7 @@ class SubscriptionPusher:
         self._enable_video_push = enable_video_push
         self._skip_video_dynamic = skip_video_dynamic
         self._skip_empty_dynamic = skip_empty_dynamic
+        self._skip_forward_dynamic = skip_forward_dynamic
         self._max_items = max(1, max_items_per_push)
         self._scan_interval = max(10, scan_interval_seconds)
         self._font_path = font_path
@@ -275,6 +284,26 @@ class SubscriptionPusher:
 
         return lines
 
+    async def push_latest_video(self, uid: str, session_id: str) -> list[str]:
+        """测试命令用：推送最新一条视频（不受过滤开关影响）。
+
+        推送成功后推进状态，避免后台轮询把同一条视频再推一遍。
+        """
+        try:
+            videos = await self._client.fetch_videos(uid, limit=1)
+        except Exception as exc:
+            return [f"视频抓取异常：{exc}"]
+        if not videos:
+            return ["没有取到视频"]
+
+        delivered = await self._send_video_to_sessions(
+            (session_id,), videos[0]
+        )
+        if delivered:
+            await self._store.set(uid, "video", videos[0].bvid)
+            return [f"已推送最新视频：{videos[0].bvid}"]
+        return ["视频推送失败"]
+
     async def dry_run(self) -> list[str]:
         report: list[str] = []
         for sub in self._subscriptions:
@@ -328,6 +357,21 @@ class SubscriptionPusher:
         if self._quiet_logged:
             self._quiet_logged = False
             logger.info("bili-subscription 静音时段结束，恢复检查")
+
+        # 风控熔断：客户端进入冷却期时暂停一切后台 B 站请求，
+        # 冷却结束自动恢复，避免被封期间继续硬刚加重风控
+        if self._client.in_cooldown():
+            if not self._cooldown_logged:
+                self._cooldown_logged = True
+                logger.warning(
+                    "bili-subscription 风控冷却中（剩余约 %d 秒），"
+                    "暂停后台检查，冷却结束自动恢复",
+                    self._client.cooldown_remaining_seconds(),
+                )
+            return
+        if self._cooldown_logged:
+            self._cooldown_logged = False
+            logger.info("bili-subscription 风控冷却结束，恢复后台检查")
 
         # 每天刷新一次 bili_ticket，维持 Cookie 指纹新鲜度
         if now - self._last_ticket_refresh >= _TICKET_REFRESH_SECONDS:
@@ -664,6 +708,9 @@ class SubscriptionPusher:
             return set(sessions)
         if self._skip_empty_dynamic and is_empty_dynamic(dynamic):
             logger.debug("跳过空动态 %s", dynamic.dynamic_id)
+            return set(sessions)
+        if self._skip_forward_dynamic and dynamic.kind == "DYNAMIC_TYPE_FORWARD":
+            logger.debug("跳过转发动态 %s", dynamic.dynamic_id)
             return set(sessions)
         return await self._push_dynamic(sub, dynamic, sessions)
 

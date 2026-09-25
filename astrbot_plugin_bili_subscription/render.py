@@ -427,7 +427,8 @@ def _render_dynamic_sync(
     fixed_height = header_height + body_height + footer_height + _PADDING
     image_budget = max(0, _CARD_MAX_HEIGHT - fixed_height)
     scaled_images, image_area_height = _prepare_images(
-        images, max_text_width, height_budget=image_budget or None
+        images, max_text_width, height_budget=image_budget or None,
+        compose=True,
     )
 
     # ---- 总高 ----
@@ -506,26 +507,85 @@ def _load_avatar(data: bytes | None, size: int) -> Image.Image | None:
         return None
 
 
+def _compose_tiles(images: list[Image.Image]) -> list[Image.Image]:
+    """把疑似同一张大图的切片拼回一张图。
+
+    判定规则：
+    - 四宫格/九宫格：张数为完全平方（4/9）且所有切片尺寸一致；
+    - 竖排长图：所有切片等宽（长截图被切成几段）；
+    - 横排宽图：所有切片等高（宽图被切成几段）。
+    其余情况保持原样，交给上层按普通多图处理。
+    """
+    n = len(images)
+    if n < 2:
+        return images
+    dims = [(im.width, im.height) for im in images]
+    widths = [d[0] for d in dims]
+    heights = [d[1] for d in dims]
+    same_w = all(w == widths[0] for w in widths)
+    same_h = all(h == heights[0] for h in heights)
+
+    # 九宫格 / 四宫格
+    if n in (4, 9) and same_w and same_h:
+        cols = 2 if n == 4 else 3
+        rows = n // cols
+        tile_w, tile_h = dims[0]
+        canvas = Image.new("RGB", (cols * tile_w, rows * tile_h), _BG_COLOR)
+        for index, img in enumerate(images):
+            row, col = divmod(index, cols)
+            canvas.paste(img, (col * tile_w, row * tile_h))
+        return [canvas]
+
+    # 竖排长图
+    if same_w:
+        total_h = sum(heights)
+        canvas = Image.new("RGB", (widths[0], total_h), _BG_COLOR)
+        y = 0
+        for img in images:
+            canvas.paste(img, (0, y))
+            y += img.height
+        return [canvas]
+
+    # 横排宽图
+    if same_h:
+        total_w = sum(widths)
+        canvas = Image.new("RGB", (total_w, heights[0]), _BG_COLOR)
+        x = 0
+        for img in images:
+            canvas.paste(img, (x, 0))
+            x += img.width
+        return [canvas]
+
+    return images
+
+
 def _prepare_images(
     images: list[bytes],
     max_width: int,
     *,
     height_budget: int | None = None,
+    compose: bool = False,
 ) -> tuple[list[Image.Image], int]:
     """只做缩放，不做单独压缩。
 
     这样最终只有一次 JPEG 编码（_save_canvas 里的），画质和 CPU 都更优。
     height_budget 是图片区域（含间距）的总高预算；超预算时整体等比缩小，
     保证卡片总高不会超过平台拒收的尺寸。
+    compose=True 时（图文动态），若多张图是同一张大图的切片，先拼回一张
+    大图再缩放，直观呈现"几张小图拼成的大图"。
     """
-    prepared: list[tuple[Image.Image, int, int]] = []
-    total_height = 0
+    decoded: list[Image.Image] = []
     for data in images:
         try:
-            img = Image.open(io.BytesIO(data)).convert("RGB")
+            decoded.append(Image.open(io.BytesIO(data)).convert("RGB"))
         except Exception:
             continue
+    if compose:
+        decoded = _compose_tiles(decoded)
 
+    prepared: list[tuple[Image.Image, int, int]] = []
+    total_height = 0
+    for img in decoded:
         # 先只计算目标尺寸，最后统一 resize 一次（避免二次缩放失真）
         w = min(img.width, max_width)
         h = max(1, int(img.height * w / img.width))
