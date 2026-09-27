@@ -64,8 +64,15 @@
   "min_request_gap_seconds": {
     "description": "两次请求之间的最小间隔（秒）",
     "type": "float",
-    "default": 1.5,
-    "hint": "值越大越不容易触发 B 站风控，但推送速度会变慢。\n推荐 1.0 ~ 3.0，默认 1.5。"
+    "default": 2.0,
+    "hint": "值越大越不容易触发 B 站风控，但推送速度会变慢。\n推荐 2.0 ~ 4.0，默认 2.0；频繁被风控时建议调到 3.0 以上。"
+  },
+  "risk_cooldown_minutes": {
+    "description": "风控熔断冷却时长（分钟）",
+    "type": "int",
+    "default": 15,
+    "slider": { "min": 5, "max": 120, "step": 5 },
+    "hint": "连续多次遭遇风控后，后台检查会自动暂停这段时间，冷却结束自动恢复。\n反复被封时冷却会自动逐级翻倍（最长 2 小时）。\n频繁被风控的账号建议调大（30 分钟以上）。"
   },
   "max_concurrent_checks": {
     "description": "同时检查的订阅数上限",
@@ -116,7 +123,26 @@
   "enable_node_forward": {
     "description": "是否以合并转发（聊天记录）形式发送动态/专栏图片",
     "type": "bool",
-    "default": true
+    "default": true,
+    "hint": "关闭后连 GIF 动图也会只剩卡片里的静态首帧。"
+  },
+  "forward_originals": {
+    "description": "原图同时发聊天记录（默认开启）",
+    "type": "bool",
+    "default": true,
+    "hint": "开启时：卡片之外再发一条合并转发，内含全分辨率原图，方便放大看长图文字。\n关闭时：只保留卡片一条消息（GIF 动图仍会单独转发以保留动画）。"
+  },
+  "retry_failed_push": {
+    "description": "推送失败时自动重试（默认关闭，避免重复推送）",
+    "type": "bool",
+    "default": false,
+    "hint": "默认「至多推送一次」：发送失败只记日志、不再重发。\n因为平台经常出现「消息已送达却回报失败」的情况，重试会让同一条动态推送多遍。\n如果你更看重送达率、能容忍偶发重复，再打开这个开关。"
+  },
+  "recall_duplicates": {
+    "description": "检测到重复推送时自动撤回（推荐开启）",
+    "type": "bool",
+    "default": true,
+    "hint": "插件会给每条已推送内容记账（插件数据目录的 push_ledger.json），\n同一条内容对同一个群只会发送一次，重启插件也不会重发。\n万一同一条内容仍被重复发出，插件会按消息 ID 自动撤回多出来的那条。\n\n注意：QQ 只允许撤回 2 分钟内的消息，超时会被平台拒绝（日志里会提示）。\n关闭后插件不会撤回任何消息。"
   },
   "skip_video_dynamic": {
     "description": "动态是原创投稿视频时不推送",

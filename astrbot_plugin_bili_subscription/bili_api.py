@@ -103,10 +103,15 @@ _MIN_GAP_CEILING = 10.0     # 遇风控时拉长的上限
 _JITTER_MAX = 0.8
 _SPEED_UP_STREAK = 5        # 连续成功 N 次才恢复一档
 
-# 风控熔断：连续多次风控错误后进入冷却期，后台完全停止请求
+# 风控熔断：连续多次风控错误后进入冷却期，后台完全停止请求。
+# 反复被封时冷却时长逐级翻倍（最长 2 小时），长时间未触发后回落。
 _RISK_CONTROL_CODES = (-352, -412, -509, -799)
 _RISK_STREAK_THRESHOLD = 3
-_RISK_COOLDOWN_SECONDS = 15 * 60
+_RISK_COOLDOWN_BASE_SECONDS = 15 * 60
+_RISK_COOLDOWN_MAX_SECONDS = 2 * 3600
+_RISK_ESCALATION_RESET_SECONDS = 3600
+# -352 后立即补 bili_ticket 的最小间隔（避免封禁期频繁请求）
+_TICKET_REFRESH_MIN_INTERVAL_SECONDS = 600
 
 # 动态类型 → 中文标签（显示在卡片头部）
 _KIND_CN = {
@@ -319,6 +324,7 @@ class BiliSubscriptionClient:
         *,
         min_request_gap: float = _DEFAULT_MIN_GAP,
         video_quality: int = _DEFAULT_VIDEO_QUALITY,
+        risk_cooldown_seconds: int = _RISK_COOLDOWN_BASE_SECONDS,
     ) -> None:
         self._session = session
         self._credentials_getter = credentials_getter
@@ -345,6 +351,12 @@ class BiliSubscriptionClient:
         # 风控熔断状态
         self._risk_streak = 0
         self._cooldown_until = 0.0
+        self._cooldown_escalation = 0
+        self._last_risk_ts = 0.0
+        self._risk_cooldown_seconds = max(60, int(risk_cooldown_seconds))
+
+        # bili_ticket 最近一次成功刷新的时间（-352 后按需补刷新）
+        self._last_ticket_refresh_ts = 0.0
 
         self._cred_cache: dict[str, str] = {}
         self._cred_expires = 0.0
@@ -360,6 +372,14 @@ class BiliSubscriptionClient:
         except (TypeError, ValueError):
             return
         self._video_quality = min(max(value, 16), 127)
+
+    def set_risk_cooldown(self, minutes: int) -> None:
+        """热更新风控冷却时长（分钟），限制在 [1, 1440]。"""
+        try:
+            value = int(minutes)
+        except (TypeError, ValueError):
+            return
+        self._risk_cooldown_seconds = max(60, min(value * 60, 24 * 3600))
 
     # ------------------------------------------------------------------
     # 订阅抓取
@@ -431,16 +451,26 @@ class BiliSubscriptionClient:
         """抓取专栏正文里的插图 URL（供卡片配图），失败返回空元组。
 
         只在新专栏需要推送时调用，避免无谓请求。
-        该接口同样受风控影响，这里用带退避重试的请求，遇到 -352
-        会拉长节流并重试，尽量避免正文插图抓取失败。
+        该接口受风控影响：先用带退避重试的普通请求，失败再带 WBI
+        签名重试一次，尽量拿到正文插图而不是只有封面。
         """
+        data: dict[str, Any] | None = None
         try:
             data = await self._request_with_backoff(
-                _ARTICLE_VIEW_URL, {"id": article_id}, wbi=False
+                _ARTICLE_VIEW_URL, {"id": article_id}, wbi=False,
+                max_attempts=2,
             )
-        except BiliApiError as exc:
-            logger.debug("bili-api 专栏正文 %s 抓取失败：%s", article_id, exc)
-            return ()
+        except BiliApiError:
+            data = None
+        if data is None:
+            try:
+                data = await self._request_with_backoff(
+                    _ARTICLE_VIEW_URL, {"id": article_id}, wbi=True,
+                    max_attempts=2,
+                )
+            except BiliApiError as exc:
+                logger.debug("bili-api 专栏正文 %s 抓取失败：%s", article_id, exc)
+                return ()
         content = data.get("content") if isinstance(data, dict) else None
         if not isinstance(content, str) or not content:
             return ()
@@ -565,6 +595,7 @@ class BiliSubscriptionClient:
         except Exception as exc:
             logger.debug("bili-api 写入 bili_ticket 失败：%s", exc)
             return False
+        self._last_ticket_refresh_ts = time.monotonic()
         logger.info("bili-api bili_ticket 已刷新")
         return True
 
@@ -779,16 +810,43 @@ class BiliSubscriptionClient:
         return self._ua
 
     def _note_risk_error(self) -> None:
-        """记录一次风控错误；连续多次后进入冷却期（熔断）。"""
+        """记录一次风控错误；连续多次后进入冷却期（熔断）。
+
+        反复被封时冷却时长逐级翻倍（最长 2 小时），
+        长时间未再触发风控时级别自动回落。
+        """
+        now = time.monotonic()
+        if now - self._last_risk_ts > _RISK_ESCALATION_RESET_SECONDS:
+            self._cooldown_escalation = 0
+        self._last_risk_ts = now
         self._risk_streak += 1
         if self._risk_streak >= _RISK_STREAK_THRESHOLD:
             self._risk_streak = 0
-            self._cooldown_until = time.monotonic() + _RISK_COOLDOWN_SECONDS
+            cooldown = min(
+                self._risk_cooldown_seconds * (2 ** self._cooldown_escalation),
+                _RISK_COOLDOWN_MAX_SECONDS,
+            )
+            self._cooldown_escalation += 1
+            self._cooldown_until = now + cooldown
             logger.warning(
                 "bili-api 连续遭遇风控，进入 %.0f 分钟冷却期，"
                 "期间后台轮询停止请求，冷却结束自动恢复",
-                _RISK_COOLDOWN_SECONDS / 60,
+                cooldown / 60,
             )
+
+    async def _maybe_refresh_ticket(self) -> None:
+        """-352 后按需补一次 bili_ticket（10 分钟内最多一次）。
+
+        被封时刷新 Cookie 指纹有时能立即脱困；限频避免雪上加霜。
+        """
+        if time.monotonic() - self._last_ticket_refresh_ts < (
+            _TICKET_REFRESH_MIN_INTERVAL_SECONDS
+        ):
+            return
+        try:
+            await self.refresh_bili_ticket()
+        except Exception as exc:
+            logger.debug("bili-api 风控后刷新 bili_ticket 失败：%s", exc)
 
     def in_cooldown(self) -> bool:
         """是否处于风控冷却期（熔断中）。"""
@@ -983,9 +1041,11 @@ class BiliSubscriptionClient:
                     self._slow_down()
                     self._note_risk_error()
                     if exc.code == -352:
-                        # WBI 密钥可能已过期，强制下次重新获取
+                        # WBI 密钥可能已过期，强制下次重新获取；
+                        # 顺便按需补一次 bili_ticket 刷新 Cookie 指纹
                         self._wbi_key = None
                         self._wbi_expires = 0.0
+                        await self._maybe_refresh_ticket()
                 if attempt == max_attempts - 1:
                     break
                 delay = _BACKOFF_DELAYS[min(attempt, len(_BACKOFF_DELAYS) - 1)]

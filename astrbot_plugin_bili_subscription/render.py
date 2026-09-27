@@ -85,22 +85,27 @@ _EXTRA_FONT_PATTERN = re.compile(
 _MISSING_CHAR = "\U0010FFFF"
 _notdef_bbox_cache: dict[int, tuple] = {}
 
-_CARD_WIDTH = 720
+_CARD_WIDTH = 860
 _PADDING = 24
-# 单张图的最大高度：防止极端长图把卡片撑爆。
-# 一般长截图（如 1080×4000）缩到卡片宽 672 后约 2400 高，仍能完整清晰显示，
-# 而不是被压成 ~200px 宽的小条导致文字看不清。
-_MAX_IMAGE_HEIGHT = 3000
+# 单张图在卡片里的最大高度：控制卡片消息别过高。
+# 需要看全图文字时点开合并转发的"原图"（全分辨率原图）即可，
+# 卡片只承担预览职责。
+_MAX_IMAGE_HEIGHT = 1600
+
+# 多图网格排版的间距
+_GRID_GAP = 12
 
 # 整张卡片（含所有嵌入图）的字节上限
 _CARD_MAX_BYTES = 2 * 1024 * 1024
 
-# 卡片总高度上限：过高的图部分平台会拒收或压缩失真
-_CARD_MAX_HEIGHT = 4096
+# 卡片总高度上限：过高的图部分平台会拒收或压缩失真，
+# 也避免一条消息刷屏太长
+_CARD_MAX_HEIGHT = 3000
 
-# 正文最大字符数：防止超长文本把卡片撑爆、拖慢渲染
-_BODY_MAX_CHARS = 800
-_TRUNCATION_NOTE = "\n\n……（正文过长，已截断）"
+# 正文最大字符数：B 站动态正文上限约 2000 字，
+# 这里放宽到能完整容纳正文（只有极端异常数据才会被截断）
+_BODY_MAX_CHARS = 2000
+_TRUNCATION_NOTE = "\n\n……（正文过长，此处节选）"
 
 # 从高到低的 quality 序列；依次尝试直到卡片大小达标
 _JPEG_QUALITY_STEPS = (88, 80, 72, 64, 56, 48)
@@ -344,7 +349,8 @@ def _render_sync(
     fixed_height = _PADDING + title_height + body_height + footer_height + _PADDING
     image_budget = max(0, _CARD_MAX_HEIGHT - fixed_height)
     scaled_images, image_area_height = _prepare_images(
-        images, max_text_width, height_budget=image_budget or None
+        images, max_text_width, height_budget=image_budget or None,
+        grid=True,
     )
 
     total_height = fixed_height + image_area_height
@@ -428,7 +434,7 @@ def _render_dynamic_sync(
     image_budget = max(0, _CARD_MAX_HEIGHT - fixed_height)
     scaled_images, image_area_height = _prepare_images(
         images, max_text_width, height_budget=image_budget or None,
-        compose=True,
+        compose=True, grid=True,
     )
 
     # ---- 总高 ----
@@ -559,12 +565,37 @@ def _compose_tiles(images: list[Image.Image]) -> list[Image.Image]:
     return images
 
 
+def _decide_columns(count: int) -> int:
+    """按常见图文排版习惯决定列数。
+
+    1 张整宽；2 张、4 张用两列；其余（3、5~9 张）用三列。
+    这样多图动态不会把卡片拉得很高。
+    """
+    if count <= 1:
+        return 1
+    if count in (2, 4):
+        return 2
+    return 3
+
+
+def _fit_cell(img: Image.Image, cell_width: int) -> tuple[Image.Image, int, int]:
+    """把单张图等比缩到单元格宽度（不放大），并限制单图最高。"""
+    w = min(img.width, cell_width)
+    h = max(1, int(img.height * w / img.width))
+    if h > _MAX_IMAGE_HEIGHT:
+        ratio = _MAX_IMAGE_HEIGHT / h
+        h = _MAX_IMAGE_HEIGHT
+        w = max(1, int(w * ratio))
+    return img, w, h
+
+
 def _prepare_images(
     images: list[bytes],
     max_width: int,
     *,
     height_budget: int | None = None,
     compose: bool = False,
+    grid: bool = False,
 ) -> tuple[list[Image.Image], int]:
     """只做缩放，不做单独压缩。
 
@@ -573,6 +604,8 @@ def _prepare_images(
     保证卡片总高不会超过平台拒收的尺寸。
     compose=True 时（图文动态），若多张图是同一张大图的切片，先拼回一张
     大图再缩放，直观呈现"几张小图拼成的大图"。
+    grid=True 时多图按网格横排（1 张整宽 / 2、4 张两列 / 其余三列），
+    避免多图纵向堆叠导致卡片过高。
     """
     decoded: list[Image.Image] = []
     for data in images:
@@ -582,23 +615,63 @@ def _prepare_images(
             continue
     if compose:
         decoded = _compose_tiles(decoded)
+    if not decoded:
+        return [], 0
 
-    prepared: list[tuple[Image.Image, int, int]] = []
-    total_height = 0
-    for img in decoded:
-        # 先只计算目标尺寸，最后统一 resize 一次（避免二次缩放失真）
-        w = min(img.width, max_width)
-        h = max(1, int(img.height * w / img.width))
+    columns = _decide_columns(len(decoded)) if grid else 1
+    if columns <= 1 or len(decoded) == 1:
+        return _layout_column(decoded, max_width, height_budget)
 
-        # 单张图高不超过 _MAX_IMAGE_HEIGHT
-        if h > _MAX_IMAGE_HEIGHT:
-            ratio = _MAX_IMAGE_HEIGHT / h
-            h = _MAX_IMAGE_HEIGHT
-            w = max(1, int(w * ratio))
+    cell_width = max(
+        1, (max_width - _GRID_GAP * (columns - 1)) // columns
+    )
+    prepared = [_fit_cell(img, cell_width) for img in decoded]
 
-        prepared.append((img, w, h))
-        total_height += h + 12
+    rows: list[list[tuple[Image.Image, int, int]]] = [
+        prepared[i:i + columns] for i in range(0, len(prepared), columns)
+    ]
+    row_heights = [max(item[2] for item in row) for row in rows]
+    total_height = sum(row_heights) + _GRID_GAP * (len(rows) - 1)
 
+    factor = 1.0
+    if height_budget is not None and total_height > height_budget > 0:
+        factor = height_budget / total_height
+
+    scaled_cell = max(1, int(cell_width * factor))
+    grid_width = min(
+        max_width, columns * scaled_cell + _GRID_GAP * (columns - 1)
+    )
+    canvas_height = max(
+        1,
+        sum(max(1, int(h * factor)) for h in row_heights)
+        + _GRID_GAP * (len(rows) - 1),
+    )
+    canvas = Image.new("RGB", (grid_width, canvas_height), _BG_COLOR)
+
+    y = 0
+    for row, row_height in zip(rows, row_heights):
+        for index, (img, w, h) in enumerate(row):
+            new_w, new_h = max(1, int(w * factor)), max(1, int(h * factor))
+            if (new_w, new_h) != img.size:
+                img = img.resize((new_w, new_h), _LANCZOS)
+            x = index * (scaled_cell + _GRID_GAP)
+            # 图比单元格窄时居中，视觉更整齐
+            x += max(0, (scaled_cell - new_w) // 2)
+            canvas.paste(img, (x, y))
+        y += max(1, int(row_height * factor)) + _GRID_GAP
+
+    return [canvas], canvas.height + _GRID_GAP
+
+
+def _layout_column(
+    decoded: list[Image.Image],
+    max_width: int,
+    height_budget: int | None,
+) -> tuple[list[Image.Image], int]:
+    """单列排版：每张整宽，纵向堆叠（原有行为）。"""
+    prepared = [_fit_cell(img, max_width) for img in decoded]
+
+    total_height = sum(h + _GRID_GAP for _, _, h in prepared)
     factor = 1.0
     if height_budget is not None and total_height > height_budget > 0:
         factor = height_budget / total_height
@@ -610,7 +683,7 @@ def _prepare_images(
         if (new_w, new_h) != img.size:
             img = img.resize((new_w, new_h), _LANCZOS)
         result.append(img)
-        final_height += new_h + 12
+        final_height += new_h + _GRID_GAP
     return result, final_height
 
 

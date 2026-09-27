@@ -19,6 +19,14 @@ from astrbot.api.star import Context, Star, StarTools
 from astrbot.core.message.message_event_result import MessageChain
 
 try:
+    from astrbot.core.platform.astr_message_event import MessageSesion
+except ImportError:  # pragma: no cover - 兼容旧版本路径
+    try:
+        from astrbot.core.platform.message_session import MessageSession as MessageSesion  # type: ignore
+    except ImportError:
+        MessageSesion = None  # type: ignore[assignment]
+
+try:
     from astrbot.api.message_components import Node, Nodes
     _NODE_AVAILABLE = True
 except ImportError:
@@ -37,9 +45,10 @@ from .bili_player_bridge import (
     has_bilibili_login,
     read_bilibili_cookies,
 )
-from .pusher import SubscriptionPusher, is_empty_dynamic, is_gif
+from .pusher import SendOutcome, SubscriptionPusher, is_empty_dynamic, is_gif
 from .render import pil_available, render_dynamic_card
 from .subscription import (
+    PushLedger,
     RuntimeSubStore,
     Subscription,
     SubscriptionStateStore,
@@ -282,6 +291,7 @@ class BiliSubscriptionPlugin(Star):
         self._http: aiohttp.ClientSession | None = None
         self._client: BiliSubscriptionClient | None = None
         self._store: SubscriptionStateStore | None = None
+        self._ledger: PushLedger | None = None
         self._runtime_store: RuntimeSubStore | None = None
         self._pusher: SubscriptionPusher | None = None
         self._downloader: BiliVideoDownloader | None = None
@@ -290,6 +300,9 @@ class BiliSubscriptionPlugin(Star):
         self._last_subs_signature: tuple[str, ...] = ()
         # 视频发送大小上限（字节）；0 表示不限制
         self._max_video_send_bytes = 0
+        # 撤回相关：是否启用、最近一次撤回结果（供命令展示）
+        self._recall_enabled = True
+        self._last_recall_report: list[str] = []
 
     # ------------------------------------------------------------------
     # 配置
@@ -343,8 +356,15 @@ class BiliSubscriptionPlugin(Star):
                 )
             except (TypeError, ValueError):
                 self._client.set_video_quality(32)
+            try:
+                self._client.set_risk_cooldown(
+                    int(self._config.get("risk_cooldown_minutes") or 15)
+                )
+            except (TypeError, ValueError):
+                self._client.set_risk_cooldown(15)
 
         quiet_enabled, quiet_start, quiet_end = self._quiet_options()
+        self._recall_enabled = bool(self._config.get("recall_duplicates", True))
         if self._pusher is not None:
             try:
                 self._pusher.update_options(
@@ -359,6 +379,9 @@ class BiliSubscriptionPlugin(Star):
                     ),
                     skip_forward_dynamic=bool(
                         self._config.get("skip_forward_dynamic", True)
+                    ),
+                    retry_failed_push=bool(
+                        self._config.get("retry_failed_push", False)
                     ),
                     max_items_per_push=int(
                         self._config.get("max_items_per_push") or 5
@@ -503,15 +526,35 @@ class BiliSubscriptionPlugin(Star):
                 video_quality = int(self._config.get("video_quality") or 32)
             except (TypeError, ValueError):
                 video_quality = 32
+            try:
+                risk_cooldown_minutes = int(
+                    self._config.get("risk_cooldown_minutes") or 15
+                )
+            except (TypeError, ValueError):
+                risk_cooldown_minutes = 15
 
             client = BiliSubscriptionClient(
                 http,
                 credentials_getter=lambda: read_bilibili_cookies(bili_player_dir),
                 min_request_gap=min_gap,
                 video_quality=video_quality,
+                risk_cooldown_seconds=risk_cooldown_minutes * 60,
             )
             store = SubscriptionStateStore(data_dir / "subscription_state.json")
             await store.load()
+            logger.info(
+                "bili-subscription 推送进度文件：%s（已记录 %d 个 UP）",
+                store.path, store.tracked_uids,
+            )
+
+            # 推送台账：按「内容 ID + 会话」持久化记账，重启也不会重复推送，
+            # 同时保存每条消息的 ID，用于"发现重复时撤回"
+            ledger = PushLedger(data_dir / "push_ledger.json")
+            await ledger.load()
+            logger.info(
+                "bili-subscription 推送台账：%s（%d 条内容 / %d 条消息记录）",
+                ledger.path, ledger.item_count, ledger.message_count(),
+            )
 
             runtime_store = RuntimeSubStore(data_dir / "runtime_subscriptions.json")
             await runtime_store.load()
@@ -555,6 +598,7 @@ class BiliSubscriptionPlugin(Star):
             pusher = SubscriptionPusher(
                 client=client,
                 store=store,
+                ledger=ledger,
                 send_callback=self._send_chain,
                 build_dynamic_chain=self._build_dynamic_chain,
                 send_video_to_sessions=self._send_video_to_sessions,
@@ -573,6 +617,9 @@ class BiliSubscriptionPlugin(Star):
                 skip_forward_dynamic=bool(
                     self._config.get("skip_forward_dynamic", True)
                 ),
+                retry_failed_push=bool(
+                    self._config.get("retry_failed_push", False)
+                ),
                 config_refresher=self._refresh_config_and_subs,
                 max_concurrent_checks=int(
                     self._config.get("max_concurrent_checks") or 2
@@ -588,9 +635,16 @@ class BiliSubscriptionPlugin(Star):
             pusher.update_subscriptions(subs)
             self._last_subs_signature = self._subs_signature(subs)
 
+            # 把撤回能力交给推送器：发现重复推送时按消息 ID 撤回
+            self._recall_enabled = bool(
+                self._config.get("recall_duplicates", True)
+            )
+            pusher.set_recall_callback(self._recall_messages)
+
             self._http = http
             self._client = client
             self._store = store
+            self._ledger = ledger
             self._pusher = pusher
             self._downloader = downloader
             self._bili_player_data_dir = bili_player_dir
@@ -610,6 +664,7 @@ class BiliSubscriptionPlugin(Star):
         self._downloader = None
         self._client = None
         self._store = None
+        self._ledger = None
         self._runtime_store = None
         self._http = None
         self._bili_player_data_dir = None
@@ -624,47 +679,252 @@ class BiliSubscriptionPlugin(Star):
             await http.close()
 
     # ------------------------------------------------------------------
-    # 消息构造
+    # 消息构造 / 发送
     # ------------------------------------------------------------------
-    async def _send_chain(self, session_id: str, chain: Any) -> bool:
+    def _platform_bot(self, session_id: str) -> tuple[Any, bool, str] | None:
+        """取出用于发送的 OneBot 机器人实例。
+
+        返回 (bot, is_group, session_id数字部分)；非 OneBot 平台返回 None。
+        走这条路发送才能拿到消息 ID，从而支持"重复推送时撤回"。
+        """
+        if MessageSesion is None:
+            return None
+        try:
+            session = MessageSesion.from_str(session_id)
+        except Exception:
+            return None
+        platform_id = session.platform_name
+        try:
+            platform = self.context.get_platform_inst(platform_id)
+        except Exception:
+            platform = None
+        if platform is None:
+            return None
+        bot = getattr(platform, "bot", None)
+        if bot is None or not hasattr(bot, "call_action"):
+            return None
+        is_group = _is_group_session(session)
+        raw = str(session.session_id or "")
+        if "_" in raw:
+            raw = raw.split("_")[-1]
+        return bot, is_group, raw
+
+    @staticmethod
+    async def _extract_message_id(ret: Any) -> str:
+        """从 OneBot 返回值里取出消息 ID。"""
+        if isinstance(ret, dict):
+            value = ret.get("message_id") or ret.get("msg_id")
+            return str(value) if value else ""
+        value = getattr(ret, "message_id", None)
+        return str(value) if value else ""
+
+    async def _send_chain_raw(
+        self, session_id: str, chain: Any
+    ) -> SendOutcome:
+        """发送一条（或一组）消息链，返回送达会话与消息 ID。"""
+        route = self._platform_bot(session_id)
+        outcome = SendOutcome()
+        if route is None:
+            # 非 OneBot 平台：走 AstrBot 统一发送，但拿不到消息 ID
+            try:
+                await self.context.send_message(session_id, chain)
+            except Exception:
+                logger.exception(
+                    "bili-subscription 向 %s 推送失败", session_id
+                )
+                return outcome
+            outcome.delivered.add(session_id)
+            return outcome
+
+        bot, is_group, target = route
+        if not target.isdigit():
+            try:
+                await self.context.send_message(session_id, chain)
+            except Exception:
+                logger.exception(
+                    "bili-subscription 向 %s 推送失败", session_id
+                )
+                return outcome
+            outcome.delivered.add(session_id)
+            return outcome
+
+        target_id = int(target)
+        sent_any = False
+        collected: list[str] = []
         try:
             if isinstance(chain, _SplitChain):
-                sent = False
-                if chain.first is not None:
+                segments: list[Any] = [
+                    part
+                    for part in (chain.prefix, chain.first, chain.forward)
+                    if part is not None
+                ]
+                for index, part in enumerate(segments):
                     try:
-                        await self.context.send_message(session_id, chain.first)
-                        sent = True
-                    except Exception:
-                        logger.exception(
-                            "bili-subscription 向 %s 发送卡片失败", session_id
+                        part_ids = await self._send_segment(
+                            bot, part, is_group, target_id
                         )
-                if chain.forward is not None:
-                    try:
-                        await self.context.send_message(session_id, chain.forward)
-                        sent = True
                     except Exception:
+                        # 合并转发失败很常见（平台限制），不视为整体失败
                         logger.warning(
-                            "bili-subscription 合并转发失败（已忽略）：%s",
-                            session_id,
+                            "bili-subscription 向 %s 发送第 %d 段失败（已忽略）",
+                            session_id, index + 1,
                         )
-                # 只要发出了一部分就算成功，避免"卡片已送达却被标记失败"
-                # 导致下一轮重复推送同一张卡片
-                return sent
-            await self.context.send_message(session_id, chain)
-            return True
+                        continue
+                    sent_any = True
+                    for message_id in part_ids:
+                        if message_id and message_id not in collected:
+                            collected.append(message_id)
+            else:
+                try:
+                    part_ids = await self._send_segment(
+                        bot, chain, is_group, target_id
+                    )
+                except Exception:
+                    logger.exception(
+                        "bili-subscription 向 %s 推送失败", session_id
+                    )
+                    return outcome
+                sent_any = True
+                for message_id in part_ids:
+                    if message_id and message_id not in collected:
+                        collected.append(message_id)
         except Exception:
-            logger.exception("bili-subscription 向 %s 推送失败", session_id)
-            return False
+            logger.exception("bili-subscription 向 %s 推送异常", session_id)
+            return outcome
+
+        # 只要发出了一部分就算成功，避免"卡片已送达却被标记失败"
+        # 导致下一轮重复推送同一张卡片
+        if sent_any:
+            outcome.delivered.add(session_id)
+            if collected:
+                outcome.message_ids[session_id] = collected
+        return outcome
+
+    @staticmethod
+    async def _send_segment(
+        bot: Any, chain: Any, is_group: bool, target_id: int
+    ) -> list[str]:
+        """发送一条 MessageChain，返回本次发出的全部消息 ID。
+
+        与 AstrBot 的 aiocqhttp 适配器保持一致：
+        合并转发（Node/Nodes）和文件必须单独用专用接口发送，
+        不能塞进普通消息里。
+        """
+        chain_list = getattr(chain, "chain", None) or []
+        if not any(
+            _is_forward_component(seg) or _is_file_component(seg)
+            for seg in chain_list
+        ):
+            segments = await _onebot_segments(chain)
+            if not segments:
+                return []
+            return [
+                await BiliSubscriptionPlugin._dispatch_segments(
+                    bot, is_group, target_id, segments
+                )
+            ]
+
+        collected: list[str] = []
+        for seg in chain_list:
+            if _is_forward_component(seg):
+                try:
+                    payload = await _onebot_forward_payload(seg)
+                except Exception:
+                    logger.warning(
+                        "bili-subscription 合并转发消息构造失败，已跳过"
+                    )
+                    continue
+                if is_group:
+                    payload["group_id"] = str(target_id)
+                    ret = await bot.call_action("send_group_forward_msg", **payload)
+                else:
+                    payload["user_id"] = str(target_id)
+                    ret = await bot.call_action("send_private_forward_msg", **payload)
+                message_id = await BiliSubscriptionPlugin._extract_message_id(ret)
+                if message_id:
+                    collected.append(message_id)
+                continue
+            segments = await _onebot_segments(MessageChain([seg]))
+            if not segments:
+                continue
+            message_id = await BiliSubscriptionPlugin._dispatch_segments(
+                bot, is_group, target_id, segments
+            )
+            if message_id:
+                collected.append(message_id)
+        return collected
+
+    @staticmethod
+    async def _dispatch_segments(
+        bot: Any, is_group: bool, target_id: int, segments: list[dict]
+    ) -> str:
+        """把普通消息段发给目标会话，返回消息 ID（拿不到时为空串）。"""
+        if is_group:
+            ret = await bot.call_action(
+                "send_group_msg", group_id=target_id, message=segments
+            )
+        else:
+            ret = await bot.call_action(
+                "send_private_msg", user_id=target_id, message=segments
+            )
+        return await BiliSubscriptionPlugin._extract_message_id(ret)
+
+    async def _recall_messages(
+        self, session_id: str, message_ids: tuple[str, ...]
+    ) -> int:
+        """按消息 ID 撤回消息，返回成功条数。
+
+        重复推送的兜底手段：台账发现同一条内容已经被发过时，
+        把重复发出的消息撤回，保证群里看不到第二条。
+        """
+        if not self._recall_enabled:
+            return 0
+        route = self._platform_bot(session_id)
+        if route is None:
+            logger.warning(
+                "bili-subscription 无法撤回（平台不支持或会话非法）：%s",
+                session_id,
+            )
+            return 0
+        bot, _is_group, _target = route
+        recalled = 0
+        for message_id in message_ids:
+            raw = str(message_id or "").strip()
+            if not raw:
+                continue
+            try:
+                await bot.call_action(
+                    "delete_msg", message_id=int(raw) if raw.isdigit() else raw
+                )
+                recalled += 1
+            except Exception as exc:
+                logger.warning(
+                    "bili-subscription 撤回消息 %s 失败（可能超过 2 分钟撤回时限）：%s",
+                    raw, exc,
+                )
+        return recalled
+
+    async def _send_chain(self, session_id: str, chain: Any) -> SendOutcome:
+        return await self._send_chain_raw(session_id, chain)
 
     def _build_dynamic_chain(
-        self, card_bytes: bytes | None, images: list[bytes]
+        self,
+        card_bytes: bytes | None,
+        images: list[bytes],
+        prefix_text: str | None = None,
     ) -> Any:
         """组装消息链。
 
-        - 卡片合成图打头（JPEG，动图在这里只显示第一帧）；
-        - 原图放进合并转发（聊天记录）：静态图压缩成 JPEG，
-          GIF 动图用原图字节发送以保留动画。
+        - prefix_text：仅当卡片渲染失败（如未装 Pillow）时，用文字承载正文；
+        - 卡片合成图：一条消息承载全部内容——正文（完整）+ 头像/昵称/时间
+          + 网格横排的图片；
+        - 合并转发（聊天记录）：原图与 GIF 动图（可用「原图同时发聊天记录」关闭，
+          关闭后只保留卡片一条消息）。
         """
+        prefix_chain: MessageChain | None = None
+        if prefix_text:
+            prefix_chain = MessageChain([Plain(prefix_text)])
+
         first_chain = (
             MessageChain([_image_from_bytes(card_bytes)]) if card_bytes else None
         )
@@ -676,17 +936,26 @@ class BiliSubscriptionPlugin(Star):
             and Node is not None and Nodes is not None
             and images
         ):
+            # 卡片可用时，静态原图默认不进转发（避免多出一条消息）；
+            # 卡片渲染失败时必须放进转发，否则图片就丢了。
+            include_static = (
+                card_bytes is None
+                or bool(self._config.get("forward_originals", True))
+            )
             nodes: list[Any] = []
             for index, img in enumerate(images[:6], start=1):
                 if is_gif(img):
                     label = f"动图 {index}"
                     component = _image_from_bytes(img)  # 原样，保留动画
-                elif len(img) <= _FORWARD_IMAGE_MAX_BYTES:
+                elif include_static:
                     label = f"原图 {index}"
-                    component = _image_from_bytes(img)  # 原图直发，保证文字清晰可读
+                    component = (
+                        _image_from_bytes(img)
+                        if len(img) <= _FORWARD_IMAGE_MAX_BYTES
+                        else _image_from_bytes_compressed(img)
+                    )
                 else:
-                    label = f"原图 {index}"
-                    component = _image_from_bytes_compressed(img)
+                    continue
                 nodes.append(
                     Node(
                         content=[Plain(label), component],
@@ -696,15 +965,17 @@ class BiliSubscriptionPlugin(Star):
             if nodes:
                 forward_chain = MessageChain([Nodes(nodes)])
 
-        return _SplitChain(first=first_chain, forward=forward_chain)
+        return _SplitChain(
+            prefix=prefix_chain, first=first_chain, forward=forward_chain
+        )
 
     # ------------------------------------------------------------------
     # 视频发送（含降级）
     # ------------------------------------------------------------------
     async def _send_video_to_sessions(
         self, sessions: tuple[str, ...], video: UserVideo
-    ) -> set[str]:
-        """下载视频并发送，返回成功送达的会话集合。
+    ) -> SendOutcome:
+        """下载视频并发送，返回送达会话与消息 ID。
 
         以下情况降级为"视频卡片"：
         ① 下载器不可用（没装 ffmpeg）；
@@ -713,6 +984,10 @@ class BiliSubscriptionPlugin(Star):
 
         下载预算（max_video_send_mb）通过 max_total_bytes 一路传到下载器，
         由下载器动态切给视频轨/音频轨，并在 HTTP 层提前判断是否放弃。
+
+        幂等性：文字说明与视频文件分两条消息发出。只要文字说明发成功，
+        就把该会话记为"已送达"，视频文件失败只记日志、不再重发，
+        避免下一轮把同一条文字说明再发一遍（重复刷屏）。
         """
         if self._downloader is None or not self._downloader.ffmpeg_available:
             logger.warning("bili-subscription 视频下载器不可用，降级为卡片：%s", video.bvid)
@@ -772,25 +1047,36 @@ class BiliSubscriptionPlugin(Star):
                 title=downloaded.title,
                 uploader=downloaded.uploader,
             )
-            delivered: set[str] = set()
+            outcome = SendOutcome()
             for session_id in sessions:
-                try:
-                    # 先发文字说明（标题/作者/链接），再发视频文件，
-                    # 避免部分平台把文字和视频塞在同一条消息里时丢掉文字
-                    await self.context.send_message(
-                        session_id, MessageChain([Plain(caption)])
-                    )
-                    component = Video.fromFileSystem(str(downloaded.path))
-                    await self.context.send_message(
-                        session_id, MessageChain([component])
-                    )
-                    delivered.add(session_id)
-                except Exception:
-                    logger.exception(
-                        "bili-subscription 发送视频 %s 到 %s 失败",
+                # 先发文字说明（标题/作者/链接），再发视频文件，
+                # 避免部分平台把文字和视频塞在同一条消息里时丢掉文字
+                caption_outcome = await self._send_chain_raw(
+                    session_id, MessageChain([Plain(caption)])
+                )
+                if session_id in caption_outcome.delivered:
+                    outcome.delivered.add(session_id)
+                    caption_ids = caption_outcome.message_ids.get(session_id) or []
+                    if caption_ids:
+                        outcome.message_ids[session_id] = list(caption_ids)
+                else:
+                    logger.warning(
+                        "bili-subscription 视频 %s 的文字说明未送达 %s，本轮跳过该会话",
                         video.bvid, session_id,
                     )
-            return delivered
+                    continue
+                try:
+                    await self._send_chain_raw(
+                        session_id,
+                        MessageChain([Video.fromFileSystem(str(downloaded.path))]),
+                    )
+                except Exception:
+                    logger.exception(
+                        "bili-subscription 发送视频 %s 到 %s 失败（文字已送达，"
+                        "按已推送处理，避免重复刷屏）",
+                        video.bvid, session_id,
+                    )
+            return outcome
         finally:
             try:
                 await downloaded.release()
@@ -799,10 +1085,10 @@ class BiliSubscriptionPlugin(Star):
 
     async def _send_video_fallback(
         self, sessions: tuple[str, ...], video: UserVideo, *, reason: str
-    ) -> set[str]:
+    ) -> SendOutcome:
         """视频无法发送时的降级：推送一张含封面、标题、UP 主、链接的卡片。
 
-        返回成功送达的会话集合。
+        返回送达会话与消息 ID。
         """
         # 下载封面
         cover_bytes: bytes | None = None
@@ -837,32 +1123,27 @@ class BiliSubscriptionPlugin(Star):
         # Pillow 不可用 → 退化为纯文本
         if card is None:
             text = _format_video_caption(video) + f"\n（{reason}）"
-            delivered: set[str] = set()
-            for session_id in sessions:
-                try:
-                    await self.context.send_message(
-                        session_id, MessageChain([Plain(text)])
-                    )
-                    delivered.add(session_id)
-                except Exception:
-                    logger.exception(
-                        "bili-subscription 发送视频卡片（纯文本）到 %s 失败", session_id
-                    )
-            return delivered
+            return await self._send_text_to_sessions(sessions, text)
 
         # 正常发送卡片
-        delivered = set()
+        outcome = SendOutcome()
         for session_id in sessions:
-            try:
-                await self.context.send_message(
-                    session_id, MessageChain([_image_from_bytes(card)])
-                )
-                delivered.add(session_id)
-            except Exception:
-                logger.exception(
-                    "bili-subscription 发送视频卡片到 %s 失败", session_id
-                )
-        return delivered
+            result = await self._send_chain_raw(
+                session_id, MessageChain([_image_from_bytes(card)])
+            )
+            outcome = SendOutcome.union(outcome, result)
+        return outcome
+
+    async def _send_text_to_sessions(
+        self, sessions: tuple[str, ...], text: str
+    ) -> SendOutcome:
+        outcome = SendOutcome()
+        for session_id in sessions:
+            result = await self._send_chain_raw(
+                session_id, MessageChain([Plain(text)])
+            )
+            outcome = SendOutcome.union(outcome, result)
+        return outcome
 
     # ------------------------------------------------------------------
     # 命令：订阅 / 退订（聊天内管理订阅，无需进 WebUI）
@@ -1033,6 +1314,95 @@ class BiliSubscriptionPlugin(Star):
         event.stop_event()
 
     # ------------------------------------------------------------------
+    # 命令：订阅撤回（重复推送兜底）
+    # ------------------------------------------------------------------
+    @filter.command("订阅撤回")
+    async def cmd_recall(self, event: AstrMessageEvent, arg: str = ""):
+        """撤回该 UID 已推送的消息（默认最近 3 条内容）。
+
+        用法：订阅撤回 <UID> [条数]
+        """
+        if not self._is_admin(event):
+            yield event.plain_result(self._deny_reply())
+            event.stop_event()
+            return
+        if self._ledger is None or self._pusher is None:
+            yield event.plain_result("插件未初始化")
+            event.stop_event()
+            return
+
+        self._refresh_config_and_subs()
+        tokens = (arg or "").split()
+        if not tokens or not tokens[0].isdigit():
+            yield event.plain_result(
+                "用法：订阅撤回 <B站UID> [条数]\n"
+                "撤回该 UID 最近推送的消息，用于清理重复推送。\n"
+                "条数默认 3（按内容从新到旧）。"
+            )
+            event.stop_event()
+            return
+
+        uid = tokens[0]
+        try:
+            count = max(1, min(20, int(tokens[1]))) if len(tokens) > 1 else 3
+        except (TypeError, ValueError):
+            count = 3
+
+        # 找出该 UID 最近的 count 条已推送内容（按台账插入顺序，新在后）
+        targets = await self._recent_ledger_items(uid, count)
+        if not targets:
+            yield event.plain_result(
+                f"台账里没有 UID {uid} 的推送记录，无需撤回。"
+            )
+            event.stop_event()
+            return
+
+        lines = [f"撤回 UID {uid} 最近 {len(targets)} 条内容："]
+        total = 0
+        for kind, item_id in targets:
+            message_ids = await self._pusher.ledger.message_ids(uid, kind, item_id)
+            if not message_ids:
+                lines.append(f"- {kind} {item_id}：没有记录消息 ID，跳过")
+                continue
+            delivered = await self._pusher.ledger.delivered_sessions(
+                uid, kind, item_id
+            )
+            recalled = 0
+            for session in delivered:
+                recalled += await self._recall_messages(session, message_ids)
+            total += recalled
+            await self._pusher.ledger.forget(uid, kind, item_id)
+            lines.append(
+                f"- {kind} {item_id}：尝试撤回 {len(message_ids)} 条，"
+                f"成功 {recalled} 条"
+            )
+        await self._pusher.ledger.save()
+        lines.append(f"共撤回 {total} 条消息。")
+        lines.append(
+            "注意：QQ 只允许撤回 2 分钟内的消息，超时会被平台拒绝。"
+        )
+        yield event.plain_result("\n".join(lines))
+        event.stop_event()
+
+    async def _recent_ledger_items(
+        self, uid: str, count: int
+    ) -> list[tuple[str, str]]:
+        """按类型收集该 UID 最近推送的内容 ID（新在前）。"""
+        ledger = self._ledger
+        if ledger is None:
+            return []
+        result: list[tuple[str, str]] = []
+        for kind in ("dynamic", "article", "video"):
+            ids = await ledger.known_item_ids(uid, kind)
+            if not ids:
+                continue
+            for item_id in list(ids)[::-1]:
+                result.append((kind, item_id))
+                if len(result) >= count:
+                    return result
+        return result
+
+    # ------------------------------------------------------------------
     # 命令：订阅状态
     # ------------------------------------------------------------------
     @filter.command("订阅状态")
@@ -1115,6 +1485,33 @@ class BiliSubscriptionPlugin(Star):
             self._runtime_store.count if self._runtime_store is not None else 0
         )
         lines.append(f"运行时订阅（聊天命令添加）：{runtime_count} 条，可用「订阅 / 退订」管理")
+        if self._store is not None:
+            lines.append(
+                f"推送进度文件：{self._store.path}"
+                f"（已记录 {self._store.tracked_uids} 个 UP）"
+            )
+        if self._ledger is not None:
+            lines.append(
+                f"推送台账：{self._ledger.path}"
+                f"（{self._ledger.item_count} 条内容 / "
+                f"{self._ledger.message_count()} 条消息）"
+            )
+        lines.append(
+            "重复推送保护："
+            + (
+                "已开启（按内容+会话记账，重复消息自动撤回）"
+                if self._recall_enabled
+                else "仅记录（recall_duplicates 已关闭，不会撤回）"
+            )
+        )
+        lines.append(
+            "推送失败处理："
+            + (
+                "自动重试（可能重复推送）"
+                if self._config.get("retry_failed_push", False)
+                else "至多推送一次（不重发，避免重复）"
+            )
+        )
         quiet_enabled, quiet_start, quiet_end = self._quiet_options()
         if quiet_enabled:
             lines.append(
@@ -1291,6 +1688,15 @@ class BiliSubscriptionPlugin(Star):
             lines.append(f"  {v.bvid}  [{v.uploader or '?'}]  {v.title[:40]}")
         stored = await self._store.get(uid, "video")
         lines.append(f"状态文件记录的 video：{stored or '（无）'}")
+        lines.append(
+            "状态文件最近 video 历史："
+            f"{list(await self._store.recent(uid, 'video'))[:5] or '（无）'}"
+        )
+        if self._ledger is not None:
+            lines.append(
+                "台账已记录的 video："
+                f"{sorted(await self._ledger.known_item_ids(uid, 'video'))[-5:] or '（无）'}"
+            )
 
         try:
             dynamics = await self._client.fetch_dynamics(uid, limit=3)
@@ -1311,6 +1717,15 @@ class BiliSubscriptionPlugin(Star):
             )
         stored_dyn = await self._store.get(uid, "dynamic")
         lines.append(f"状态文件记录的 dynamic：{stored_dyn or '（无）'}")
+        lines.append(
+            "状态文件最近 dynamic 历史："
+            f"{list(await self._store.recent(uid, 'dynamic'))[:5] or '（无）'}"
+        )
+        if self._ledger is not None:
+            lines.append(
+                "台账已记录的 dynamic："
+                f"{sorted(await self._ledger.known_item_ids(uid, 'dynamic'))[-5:] or '（无）'}"
+            )
 
         try:
             articles = await self._client.fetch_articles(uid, limit=3)
@@ -1322,6 +1737,15 @@ class BiliSubscriptionPlugin(Star):
             lines.append(f"  {a.article_id}  {a.title[:40]}")
         stored_art = await self._store.get(uid, "article")
         lines.append(f"状态文件记录的 article：{stored_art or '（无）'}")
+        lines.append(
+            "状态文件最近 article 历史："
+            f"{list(await self._store.recent(uid, 'article'))[:5] or '（无）'}"
+        )
+        if self._ledger is not None:
+            lines.append(
+                "台账已记录的 article："
+                f"{sorted(await self._ledger.known_item_ids(uid, 'article'))[-5:] or '（无）'}"
+            )
 
         yield event.plain_result("\n".join(lines))
         event.stop_event()
@@ -1346,6 +1770,100 @@ def _event_str(event: AstrMessageEvent, method_name: str) -> str | None:
 
 # 合并转发里单张原图超过该字节数才压缩（否则直接发原图，保证文字可读）
 _FORWARD_IMAGE_MAX_BYTES = 6 * 1024 * 1024
+
+
+def _is_group_session(session: Any) -> bool:
+    """判断会话是否群聊。
+
+    ``str(message_type)`` 在枚举实现不同时可能是
+    ``"MessageType.GROUP_MESSAGE"`` 或 ``"GroupMessage"``，
+    因此先用枚举成员判断，再用字符串兜底。
+    """
+    message_type = getattr(session, "message_type", None)
+    if message_type is None:
+        return False
+    try:
+        from astrbot.core.platform.message_type import MessageType
+
+        if isinstance(message_type, MessageType):
+            return message_type == MessageType.GROUP_MESSAGE
+    except Exception:
+        pass
+    text = str(message_type)
+    return "GroupMessage" in text or "GROUP_MESSAGE" in text
+
+
+async def _onebot_segments(chain: Any) -> list[dict]:
+    """把单条 MessageChain 转成 OneBot v11 消息段。
+
+    优先复用 AstrBot 自带的转换逻辑（保证与框架行为一致）；
+    框架版本变了或导入失败时，退回到本地实现。
+
+    注意：``Nodes``（合并转发）不属于普通消息段，必须走
+    ``send_group_forward_msg`` / ``send_private_forward_msg``，
+    否则会被当成一条普通消息发出去，动画/原图就丢了。
+    """
+    chain_list = getattr(chain, "chain", None)
+    if not chain_list:
+        return []
+    try:
+        from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import (
+            AiocqhttpMessageEvent,
+        )
+
+        segments = await AiocqhttpMessageEvent._parse_onebot_json(chain)
+        if segments:
+            return segments
+    except Exception:
+        pass
+    return await _onebot_segments_fallback(chain_list)
+
+
+async def _onebot_segments_fallback(chain_list: Any) -> list[dict]:
+    """本地实现的消息段转换（AstrBot 内部接口不可用时使用）。"""
+    segments: list[dict] = []
+    for segment in chain_list:
+        try:
+            if type(segment).__name__ in ("Image", "Record"):
+                bs64 = await segment.convert_to_base64()
+                segments.append(
+                    {
+                        "type": segment.type.lower(),
+                        "data": {"file": f"base64://{bs64}"},
+                    }
+                )
+            else:
+                segments.append(segment.toDict())
+        except Exception:
+            logger.warning("bili-subscription 消息段转换失败，已跳过：%r", segment)
+    return segments
+
+
+async def _onebot_forward_payload(segment: Any) -> dict:
+    """把 Node / Nodes 组件转成 send_*_forward_msg 的 payload。"""
+    node = segment
+    if type(segment).__name__ == "Node":
+        if Nodes is None:
+            raise ValueError("当前 AstrBot 不支持合并转发")
+        node = Nodes([segment])
+    to_dict = getattr(node, "to_dict", None)
+    if not callable(to_dict):
+        raise ValueError("合并转发组件缺少 to_dict")
+    return await to_dict()
+
+
+def _is_forward_component(segment: Any) -> bool:
+    """Node / Nodes 需要单独用合并转发接口发送。"""
+    if type(segment).__name__ in ("Node", "Nodes"):
+        return True
+    # 兼容子类/别名
+    if Nodes is not None and isinstance(segment, Nodes):
+        return True
+    return Node is not None and isinstance(segment, Node)
+
+
+def _is_file_component(segment: Any) -> bool:
+    return type(segment).__name__ == "File"
 
 
 def _compress_image(data: bytes, *, max_side: int = 1920, quality: int = 85) -> bytes:
@@ -1395,10 +1913,15 @@ def _image_from_bytes_compressed(data: bytes):
 
 
 class _SplitChain:
-    """包装两个 MessageChain：先发合成图，再发合并转发。"""
+    """包装多条 MessageChain：可先发全文文字，再发合成图，最后发合并转发。"""
 
     def __init__(
-        self, *, first: MessageChain | None, forward: MessageChain | None
+        self,
+        *,
+        prefix: MessageChain | None = None,
+        first: MessageChain | None = None,
+        forward: MessageChain | None = None,
     ) -> None:
+        self.prefix = prefix
         self.first = first
         self.forward = forward

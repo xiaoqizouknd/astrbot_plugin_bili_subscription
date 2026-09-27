@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -231,6 +232,24 @@ def _parse_types(text: str) -> frozenset[str]:
     return frozenset(result)
 
 
+_ID_LIST_SEP = "|"
+
+
+def _encode_id_list(ids: list[str]) -> str:
+    """把最近推送 ID 列表编码成状态文件里的一个字符串。"""
+    return _ID_LIST_SEP.join(ids)
+
+
+def _decode_id_list(value: str) -> list[str]:
+    """解析状态文件里的"最近推送 ID"。兼容旧格式（单个纯 ID）。"""
+    text = str(value or "")
+    if not text:
+        return []
+    if _ID_LIST_SEP in text:
+        return [piece for piece in text.split(_ID_LIST_SEP) if piece]
+    return [text]
+
+
 def _normalize_type(value: object) -> str:
     key = str(value or "").strip().casefold()
     return _TYPE_ALIASES.get(key, key)
@@ -246,13 +265,30 @@ class SubscriptionStateStore:
       避免写入失败导致状态永久丢失，也避免 save 期间的新改动被吞掉。
     """
 
+    # 每个 (uid, type) 额外记住的最近推送 ID 数量。
+    # 只留一个"最后一条"会导致：两次检查之间新增条目多于抓取窗口时，
+    # 窗口里找不到上一条，于是整个窗口被当成"新条目"重推一遍。
+    # 这里多留几条已知 ID，让窗口内的条目能被正确识别为"已推送过"。
+    RECENT_LIMIT = 40
+
     def __init__(self, path: str | Path) -> None:
         self._path = Path(path)
         self._state: dict[str, dict[str, str]] = {}
+        self._recent: dict[str, dict[str, list[str]]] = {}
         self._lock = asyncio.Lock()
         self._loaded = False
         self._dirty = False
         self._mutation_count = 0
+
+    @property
+    def path(self) -> Path:
+        """状态文件路径（便于排查"状态没落盘导致重复推送"）。"""
+        return self._path
+
+    @property
+    def tracked_uids(self) -> int:
+        """已记录推送进度的 UID 数量。"""
+        return len(self._state)
 
     async def load(self) -> None:
         async with self._lock:
@@ -272,28 +308,99 @@ class SubscriptionStateStore:
                 if not isinstance(entry, dict):
                     continue
                 # 兼容旧格式：忽略历史遗留的 *_ts 键
-                self._state[str(uid)] = {
+                clean = {
                     str(k): str(v)
                     for k, v in entry.items()
                     if not str(k).endswith("_ts")
                 }
+                state: dict[str, str] = {}
+                history: dict[str, list[str]] = {}
+                for key, value in clean.items():
+                    ids = _decode_id_list(value)
+                    if not ids:
+                        continue
+                    # last 就是历史里的第一条（最新）；旧格式的单个纯 ID
+                    # 会被 _decode_id_list 解析成长度为 1 的列表。
+                    state[key] = ids[0]
+                    history[key] = ids
+                self._state[str(uid)] = state
+                if history:
+                    self._recent[str(uid)] = history
 
     async def get(self, uid: str, content_type: str) -> str | None:
         async with self._lock:
             entry = self._state.get(uid)
             return entry.get(content_type) if entry else None
 
+    async def recent(self, uid: str, content_type: str) -> tuple[str, ...]:
+        """该 (uid, 类型) 最近推送过的条目 ID（从新到旧，含最后一条）。
+
+        历史列表本身就以最新在前，所以 ``recent()[0]`` 恒等于 ``get()``
+        的返回值；这里再兜一次底，避免内存状态被外部改动后不一致。
+        """
+        async with self._lock:
+            entry = self._recent.get(uid)
+            items = list(entry.get(content_type) or ()) if entry else []
+            last = (self._state.get(uid) or {}).get(content_type)
+            if last and (not items or items[0] != last):
+                items = [last, *(i for i in items if i != last)]
+            return tuple(items)
+
     async def set(self, uid: str, content_type: str, item_id: str) -> None:
         async with self._lock:
             self._state.setdefault(uid, {})[content_type] = item_id
+            self._remember_locked(uid, content_type, item_id)
             self._dirty = True
             self._mutation_count += 1
+
+    async def remember(self, uid: str, content_type: str, item_id: str) -> None:
+        """只登记"已见过"的条目，不改变内容类型的最新标记。"""
+        async with self._lock:
+            if not self._remember_locked(uid, content_type, item_id):
+                return
+            self._dirty = True
+            self._mutation_count += 1
+
+    def _remember_locked(self, uid: str, content_type: str, item_id: str) -> bool:
+        """把条目 ID 记进最近历史（去重、容量受限）。返回是否发生变化。
+
+        存储顺序为"新 → 旧"，最新一条在最前面，与 ``recent()`` 的输出一致；
+        落盘时保持相同顺序，重启后无需翻转。
+
+        注意：历史列表始终包含当前 ``last``，所以状态文件里每个
+        (uid, 类型) 只需要存这一个列表即可，不会出现"last 与历史不一致"。
+        """
+        if not item_id:
+            return False
+        bucket = self._recent.setdefault(uid, {}).setdefault(content_type, [])
+        if bucket and bucket[0] == item_id:
+            return False
+        if item_id in bucket:
+            bucket.remove(item_id)
+        bucket.insert(0, item_id)
+        # 超出容量时丢弃最早的记录
+        del bucket[self.RECENT_LIMIT:]
+        return True
 
     async def save(self) -> None:
         async with self._lock:
             if not self._dirty:
                 return
-            text = json.dumps(self._state, ensure_ascii=False, indent=2)
+            # 历史列表天然包含 last，因此直接落盘历史即可；
+            # 只为"有 last 但没有历史"的异常内存状态补一条。
+            payload: dict[str, dict[str, str]] = {}
+            for uid in set(self._state) | set(self._recent):
+                merged: dict[str, str] = {}
+                for content_type, ids in (self._recent.get(uid) or {}).items():
+                    if ids:
+                        merged[content_type] = _encode_id_list(ids)
+                last_entry = self._state.get(uid) or {}
+                for content_type, item_id in last_entry.items():
+                    if content_type not in merged and item_id:
+                        merged[content_type] = _encode_id_list([item_id])
+                if merged:
+                    payload[uid] = merged
+            text = json.dumps(payload, ensure_ascii=False, indent=2)
             saved_count = self._mutation_count
 
         self._path.parent.mkdir(parents=True, exist_ok=True)
@@ -425,3 +532,253 @@ class RuntimeSubStore:
         tmp = self._path.with_name(self._path.name + ".tmp")
         tmp.write_text(text, encoding="utf-8")
         tmp.replace(self._path)
+
+
+# ----------------------------------------------------------------------
+# 推送台账：杜绝重复推送，并保留消息 ID 以便必要时撤回
+# ----------------------------------------------------------------------
+@dataclass(frozen=True, slots=True)
+class SentRecord:
+    """一条已发出的消息。"""
+
+    uid: str
+    kind: str          # video / dynamic / article
+    item_id: str       # BV 号 / 动态 ID / 专栏 ID
+    session: str       # 会话 ID
+    message_id: str    # 平台消息 ID（拿不到时为空）
+    ts: float          # 发出时间（unix 秒）
+
+    @property
+    def dedup_key(self) -> tuple[str, str, str]:
+        return (self.uid, self.kind, self.item_id)
+
+
+def dedup_key(uid: str, kind: str, item_id: str) -> tuple[str, str, str]:
+    return (str(uid), str(kind), str(item_id))
+
+
+class PushLedger:
+    """持久化"这条内容已经发给这个会话了"的台账。
+
+    解决的问题：
+    1. **进程重启后不重复推送**。原先只在内存里记"已送达会话"，
+       插件重启/热重载后记忆清零，同一条动态会被再推一遍。
+    2. **状态文件窗口外的条目**。原先靠"上一条 ID"判断新旧，
+       两次检查之间新增条目超过抓取窗口时判断失效，整个窗口被重推。
+       台账按条目 ID 精确记账，与窗口大小无关。
+    3. **撤回依据**。每条消息的 message_id 都记下来，
+       一旦发现同一条内容被重复发出，可以按 ID 撤回。
+
+    容量策略：按"最近 N 条内容记录"裁剪，超过窗口的旧账本条目会被丢弃，
+    避免文件无限增长；被丢弃的极旧条目理论上可能重复推送，
+    但那时它早已不在抓取窗口内，不会再被扫到。
+    """
+
+    MAX_ITEMS = 800
+
+    def __init__(self, path: str | Path) -> None:
+        self._path = Path(path)
+        # (uid, kind, item_id) -> {session: [message_id, ...]}
+        self._records: dict[tuple[str, str, str], dict[str, list[str]]] = {}
+        self._lock = asyncio.Lock()
+        self._loaded = False
+        self._dirty = False
+        self._mutation_count = 0
+
+    @property
+    def path(self) -> Path:
+        return self._path
+
+    @property
+    def item_count(self) -> int:
+        return len(self._records)
+
+    def message_count(self) -> int:
+        return sum(
+            len(ids) for sessions in self._records.values()
+            for ids in sessions.values()
+        )
+
+    async def load(self) -> None:
+        async with self._lock:
+            if self._loaded:
+                return
+            self._loaded = True
+            if not self._path.exists():
+                return
+            try:
+                raw = json.loads(self._path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as exc:
+                logger.warning("bili-subscription 推送台账读取失败：%s", exc)
+                return
+            if not isinstance(raw, dict):
+                return
+            for key, value in raw.items():
+                record = _decode_ledger_entry(key, value)
+                if record is not None:
+                    self._records[record[0]] = record[1]
+
+    # ------------------------------------------------------------------
+    # 查询
+    # ------------------------------------------------------------------
+    async def delivered_sessions(
+        self, uid: str, kind: str, item_id: str
+    ) -> frozenset[str]:
+        """（内容 → 已收到该内容的会话集合）。"""
+        async with self._lock:
+            entry = self._records.get(dedup_key(uid, kind, item_id))
+            if not entry:
+                return frozenset()
+            return frozenset(entry)
+
+    async def message_ids(
+        self, uid: str, kind: str, item_id: str
+    ) -> tuple[str, ...]:
+        """该内容已发出的全部消息 ID（用于撤回，含卡片/合并转发各条）。"""
+        async with self._lock:
+            entry = self._records.get(dedup_key(uid, kind, item_id))
+            if not entry:
+                return ()
+            seen: list[str] = []
+            for ids in entry.values():
+                for message_id in ids:
+                    if message_id and message_id not in seen:
+                        seen.append(message_id)
+            return tuple(seen)
+
+    async def known_item_ids(self, uid: str, kind: str) -> frozenset[str]:
+        async with self._lock:
+            return frozenset(
+                item_id
+                for (row_uid, row_kind, item_id) in self._records
+                if row_uid == uid and row_kind == kind
+            )
+
+    # ------------------------------------------------------------------
+    # 写入
+    # ------------------------------------------------------------------
+    async def record(
+        self,
+        *,
+        uid: str,
+        kind: str,
+        item_id: str,
+        session: str,
+        message_id: str,
+    ) -> None:
+        await self.record_many(
+            uid=uid,
+            kind=kind,
+            item_id=item_id,
+            session=session,
+            message_ids=(message_id,) if message_id else (),
+        )
+
+    async def record_many(
+        self,
+        *,
+        uid: str,
+        kind: str,
+        item_id: str,
+        session: str,
+        message_ids: Iterable[str] | str,
+    ) -> None:
+        """记录"该内容已发给该会话"，并追加本次发出的消息 ID。
+
+        同一条内容可能由多条消息组成（卡片 + 合并转发），全部记下来，
+        撤回时才能一次清干净，不留半截重复内容。
+        """
+        if isinstance(message_ids, str):
+            pending = [message_ids] if message_ids else []
+        else:
+            pending = [str(m) for m in message_ids if m]
+        key = dedup_key(uid, kind, item_id)
+        async with self._lock:
+            entry = self._records.setdefault(key, {})
+            bucket = entry.setdefault(str(session), [])
+            for message_id in pending:
+                if message_id not in bucket:
+                    bucket.append(message_id)
+            self._prune_locked()
+            self._dirty = True
+            self._mutation_count += 1
+
+    async def forget(self, uid: str, kind: str, item_id: str) -> None:
+        """忘掉某条内容的台账（撤回后调用，允许以后重新推送）。"""
+        async with self._lock:
+            if self._records.pop(dedup_key(uid, kind, item_id), None) is None:
+                return
+            self._dirty = True
+            self._mutation_count += 1
+
+    async def pending_sessions(
+        self, uid: str, kind: str, item_id: str, sessions: tuple[str, ...]
+    ) -> tuple[str, ...]:
+        """该内容还没送达的会话。"""
+        delivered = await self.delivered_sessions(uid, kind, item_id)
+        return tuple(s for s in sessions if s not in delivered)
+
+    async def save(self) -> None:
+        async with self._lock:
+            if not self._dirty:
+                return
+            payload = {
+                _encode_ledger_key(key): dict(value)
+                for key, value in self._records.items()
+            }
+            text = json.dumps(payload, ensure_ascii=False, indent=2)
+            saved_count = self._mutation_count
+
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            await asyncio.to_thread(self._write_atomic, text)
+        except Exception as exc:
+            logger.warning("bili-subscription 推送台账写入失败：%s", exc)
+            return
+
+        async with self._lock:
+            if self._mutation_count == saved_count:
+                self._dirty = False
+
+    def _prune_locked(self) -> None:
+        """超出容量时丢弃最早的一半内容记录。"""
+        if len(self._records) <= self.MAX_ITEMS:
+            return
+        excess = len(self._records) - self.MAX_ITEMS // 2
+        for key in list(self._records.keys())[:excess]:
+            self._records.pop(key, None)
+
+    def _write_atomic(self, text: str) -> None:
+        tmp = self._path.with_name(self._path.name + ".tmp")
+        tmp.write_text(text, encoding="utf-8")
+        tmp.replace(self._path)
+
+
+def _encode_ledger_key(key: tuple[str, str, str]) -> str:
+    return "\x1f".join(str(piece) for piece in key)
+
+
+def _decode_ledger_entry(
+    key: str, value: object
+) -> tuple[tuple[str, str, str], dict[str, list[str]]] | None:
+    """解析台账条目。兼容旧格式（session -> 单个消息 ID 字符串）。"""
+    if not isinstance(key, str) or "\x1f" not in key:
+        return None
+    parts = key.split("\x1f")
+    if len(parts) != 3:
+        return None
+    if not isinstance(value, dict):
+        return None
+    uid, kind, item_id = parts
+    if not uid or not kind or not item_id:
+        return None
+    sessions: dict[str, list[str]] = {}
+    for session, raw in value.items():
+        name = str(session)
+        if isinstance(raw, str):
+            sessions[name] = [raw] if raw else []
+        elif isinstance(raw, (list, tuple)):
+            sessions[name] = [str(m) for m in raw if m]
+        else:
+            sessions[name] = []
+    return (uid, kind, item_id), sessions
