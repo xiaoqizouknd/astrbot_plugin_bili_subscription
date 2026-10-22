@@ -395,6 +395,7 @@ class BiliSubscriptionPlugin(Star):
                     quiet_enabled=quiet_enabled,
                     quiet_start_minutes=quiet_start,
                     quiet_end_minutes=quiet_end,
+                    enrich_body=bool(self._config.get("enrich_body", True)),
                 )
             except Exception:
                 logger.exception("bili-subscription 刷新开关失败")
@@ -627,6 +628,7 @@ class BiliSubscriptionPlugin(Star):
                 quiet_enabled=quiet_enabled,
                 quiet_start_minutes=quiet_start,
                 quiet_end_minutes=quiet_end,
+                enrich_body=bool(self._config.get("enrich_body", True)),
             )
 
             subs, errors = self._parse_subs()
@@ -943,7 +945,7 @@ class BiliSubscriptionPlugin(Star):
                 or bool(self._config.get("forward_originals", True))
             )
             nodes: list[Any] = []
-            for index, img in enumerate(images[:6], start=1):
+            for index, img in enumerate(images[:_FORWARD_IMAGE_LIMIT], start=1):
                 if is_gif(img):
                     label = f"动图 {index}"
                     component = _image_from_bytes(img)  # 原样，保留动画
@@ -1770,6 +1772,9 @@ def _event_str(event: AstrMessageEvent, method_name: str) -> str | None:
 
 # 合并转发里单张原图超过该字节数才压缩（否则直接发原图，保证文字可读）
 _FORWARD_IMAGE_MAX_BYTES = 6 * 1024 * 1024
+
+# 合并转发（聊天记录）里最多带几张原图，与卡片的图片上限保持一致
+_FORWARD_IMAGE_LIMIT = 9
 
 
 def _is_group_session(session: Any) -> bool:

@@ -2,7 +2,7 @@ name: astrbot_plugin_bili_subscription
 display_name: B站订阅推送
 desc: 自动监控 B 站账号的新视频、动态与专栏，推送到指定群聊。
 short_desc: B 站账号更新自动推送。
-version: 1.2.0
+version: 1.3.0
 astrbot_version: ">=4.26,<5"
 author: 57Darling02
 repo: https://github.com/57Darling02/astrbot_plugin_bili_subscription
@@ -42,5 +42,8 @@ readme: |
     这是防重复的保护（宁可不推，也不重复推），之后恢复正常。
   - 推送失败的条目按「至多一次」处理，不重发；连续失败 3 次后跳过。
   - 支持静音时段：时段内暂停检查，结束后自动补推。
-  - 专栏卡片自动带正文插图；卡片自动回退韩文/日文/emoji 字体，不再显示方块。
+  - 专栏卡片自动带正文全文与正文插图。
+  - 卡片自动回退韩文/日文/emoji 字体，不再显示方块。
+  - 「专栏动态」的正文图片会被接口替换成 [图片] 占位符，推送前会自动补齐完整正文与全部正文图片（可用「补齐正文」关闭）。
+  - 多图排版：相册图按 B 站网格拼（两列/三列），正文长图整宽单列。
   - GIF 动图放进合并转发（聊天记录）原样发送，保留动画效果。

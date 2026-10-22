@@ -22,6 +22,27 @@ fetch_dynamics 已同时满足；对"正文仍为空且动态含 opus/article/dr
 用 detail 接口兜底一次——只有真正要推送的动态才会产生兜底请求，
 把请求量降到最低。
 
+正文完整性（may_need_body）：
+新式 opus 动态（含"专栏动态" DYNAMIC_TYPE_ARTICLE）在 feed/detail 接口里
+都只给"摘要 + [图片] 占位符"：正文本数被截断（summary.has_more=True），
+正文里的图片更是完全不出现在任何接口字段里（detail 也只回 [图片] 两个字）。
+真正的完整正文与全部正文图片只存在于 opus 网页的 SSR 数据里
+（window.__INITIAL_STATE__.detail.modules[MODULE_TYPE_CONTENT]）。
+因此解析时若发现"正文含 [图片] 占位符"或"has_more=True"，
+就标记 may_need_body，推送前由 pusher 调用 fetch_opus_body() 抓一次网页
+（HTML，不是 api 域，走的是另一条链路，不易触发 api 风控），
+拿到按顺序排列的段落文本与全部正文图片。
+
+专栏（cv）正文：
+x/space/wbi/article 只返回摘要，正文与插图要用 x/article/view 取。
+fetch_article_body() 一次请求同时拿到"纯文本正文 + 正文插图 URL"。
+
+feed 空返回抖动：
+x/polymer/web-dynamic/v1/feed/space 会偶发返回 items=[]（同样的请求连续
+调用会 13/0 交替），插件过去会把它当"没有新内容"直接跳过，造成漏推。
+fetch_dynamics 因此对空返回做少量重试：已知有动态的 UID 最多重试 3 次，
+首次见的 UID 重试 2 次，仍为空才认为真的没有动态。
+
 此外，B 站会把置顶动态放在 items[0]，且可能是几个月前的旧动态。
 fetch_dynamics 会在返回前按 created_at 倒序排序，避免 pusher 误把
 置顶当最新。
@@ -31,12 +52,13 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import html
 import hmac
 import json
 import random
 import re
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -49,6 +71,7 @@ from astrbot.api import logger
 
 
 API_ORIGIN = "https://api.bilibili.com"
+WEB_ORIGIN = "https://www.bilibili.com"
 _NAV_URL = f"{API_ORIGIN}/x/web-interface/nav"
 _DYNAMIC_URL = f"{API_ORIGIN}/x/polymer/web-dynamic/v1/feed/space"
 _DYNAMIC_DETAIL_URL = f"{API_ORIGIN}/x/polymer/web-dynamic/v1/detail"
@@ -57,6 +80,11 @@ _ARTICLE_URL = f"{API_ORIGIN}/x/space/wbi/article"
 _ARTICLE_VIEW_URL = f"{API_ORIGIN}/x/article/view"
 _VIEW_URL = f"{API_ORIGIN}/x/web-interface/wbi/view"
 _PLAY_URL = f"{API_ORIGIN}/x/player/wbi/playurl"
+# opus 网页：正文与全部正文图片只在这里（SSR 的 __INITIAL_STATE__）
+_OPUS_PAGE_URL = f"{WEB_ORIGIN}/opus/{{dynamic_id}}"
+_INITIAL_STATE_RE = re.compile(
+    r"window\.__INITIAL_STATE__\s*=\s*(\{.*?\})\s*;", re.DOTALL
+)
 
 # UA 池：都是真实存在的较新浏览器版本，避免老版本 UA 显得可疑
 _USER_AGENTS: tuple[str, ...] = (
@@ -88,6 +116,17 @@ _IMAGE_MAX_BYTES = 8 * 1024 * 1024
 
 # 让 feed 接口返回 opus 正文所必需的业务参数
 _DYNAMIC_FEATURES = "itemOpusStyle"
+
+# 正文里"有图但图不在正文里"的占位符；feed/detail 接口都只回这个
+_IMAGE_PLACEHOLDER = "[图片]"
+# 单条动态最多推送/绘制的图片数（B 站相册上限是 9 张）
+_MAX_DYNAMIC_IMAGES = 9
+
+# feed 接口空返回抖动时的重试策略
+_EMPTY_FEED_ATTEMPTS_ACTIVE = 3   # 已知该 UID 有动态
+_EMPTY_FEED_ATTEMPTS_FIRST = 2    # 首次见到的 UID
+_EMPTY_FEED_RETRY_DELAY = 1.5
+_ACTIVE_FEED_CACHE_MAX = 200
 
 # 专栏正文 HTML 里的插图（懒加载图 data-src 优先，src 兜底）
 _ARTICLE_IMG_DATA_SRC_RE = re.compile(
@@ -144,6 +183,12 @@ _RETRYABLE_CODES = frozenset({
 })
 
 _BACKOFF_DELAYS = (5.0, 15.0, 60.0)
+
+# 风控错误（-352/-412/-509/-799）不适合按"限流"重试：
+# 它们是 IP/账号级拦截，几秒内重试基本无效，只会把请求数翻倍、
+# 把 IP 信誉压得更差。这里只等一小会儿做一次探测（顺便用新 WBI 密钥
+# 和 bili_ticket 再试一把），失败就交给熔断冷却。
+_RISK_RETRY_DELAY_SECONDS = 3.0
 
 # bili_ticket 参数（防风控指纹，约 3 天有效，需定期刷新）
 _TICKET_HMAC_KEY = b"ad1va46a7lza"
@@ -245,6 +290,35 @@ class UserDynamic:
     kind_cn: str = ""
     # 正文为空且原始结构疑似"正文被吞"时，推送前可做一次 detail 兜底
     may_need_detail: bool = False
+    # 标题（opus/article），补齐正文时用来重新拼装
+    title: str = ""
+    # 专栏动态对应的 cv 号（basic.rid_str），可用于抓专栏正文
+    article_id: str = ""
+    # 正文被截断（has_more）或含 [图片] 占位符：推送前抓一次 opus 网页正文
+    may_need_body: bool = False
+    # 图片排版："grid" 相册网格（图文动态）/ "column" 正文长图整宽单列
+    image_layout: str = "grid"
+
+
+@dataclass(frozen=True, slots=True)
+class OpusBody:
+    """opus 网页 SSR 里的完整正文。"""
+
+    text: str
+    image_urls: tuple[str, ...] = ()       # 正文里的图片（按出现顺序）
+    cover_urls: tuple[str, ...] = ()       # 顶部封面/大图
+    title: str = ""
+    author_name: str = ""
+    author_face: str = ""
+    created_at: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class ArticleBody:
+    """专栏（cv）正文：纯文本 + 正文插图。"""
+
+    text: str
+    image_urls: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -361,6 +435,10 @@ class BiliSubscriptionClient:
         self._cred_cache: dict[str, str] = {}
         self._cred_expires = 0.0
 
+        # 已知"有动态"的 UID：feed 空返回时据此决定重试次数
+        # （用 dict 当有界有序集合，超出容量丢最早的一半）
+        self._active_feeds: dict[str, None] = {}
+
         # 视频清晰度（qn），运行期可热更新
         self._video_quality = _DEFAULT_VIDEO_QUALITY
         self.set_video_quality(video_quality)
@@ -445,77 +523,61 @@ class BiliSubscriptionClient:
             )
         return result
 
+    async def fetch_article_body(
+        self, article_id: str, *, limit: int = 6
+    ) -> ArticleBody:
+        """抓取专栏正文：纯文本 + 正文插图 URL（失败返回空对象）。
+
+        列表接口（x/space/wbi/article）只给摘要，正文与插图必须走
+        x/article/view；一次请求同时把"文字"和"图"都拿回来，
+        避免为图片和正文发两次请求。
+
+        该接口受风控影响：先用带退避重试的普通请求，失败再带 WBI
+        签名重试一次。
+        """
+        data = await self._fetch_article_payload(article_id)
+        if data is None:
+            return ArticleBody(text="")
+
+        content = data.get("content")
+        text = _html_to_text(content) if isinstance(content, str) else ""
+        if not text:
+            summary = data.get("summary")
+            if isinstance(summary, str):
+                text = summary.strip()
+        return ArticleBody(
+            text=text, image_urls=_article_image_urls(data, limit=limit)
+        )
+
     async def fetch_article_content_images(
         self, article_id: str, *, limit: int = 6
     ) -> tuple[str, ...]:
-        """抓取专栏正文里的插图 URL（供卡片配图），失败返回空元组。
+        """只取专栏正文插图 URL（保留给旧调用方）。"""
+        body = await self.fetch_article_body(article_id, limit=limit)
+        return body.image_urls
 
-        只在新专栏需要推送时调用，避免无谓请求。
-        该接口受风控影响：先用带退避重试的普通请求，失败再带 WBI
-        签名重试一次，尽量拿到正文插图而不是只有封面。
-        """
-        data: dict[str, Any] | None = None
+    async def _fetch_article_payload(
+        self, article_id: str
+    ) -> dict[str, Any] | None:
+        """请求 x/article/view，返回原始 data（失败返回 None）。"""
         try:
-            data = await self._request_with_backoff(
+            return await self._request_with_backoff(
                 _ARTICLE_VIEW_URL, {"id": article_id}, wbi=False,
                 max_attempts=2,
             )
         except BiliApiError:
-            data = None
-        if data is None:
-            try:
-                data = await self._request_with_backoff(
-                    _ARTICLE_VIEW_URL, {"id": article_id}, wbi=True,
-                    max_attempts=2,
-                )
-            except BiliApiError as exc:
-                logger.debug("bili-api 专栏正文 %s 抓取失败：%s", article_id, exc)
-                return ()
-        content = data.get("content") if isinstance(data, dict) else None
-        if not isinstance(content, str) or not content:
-            return ()
-
-        urls: list[str] = []
-        seen: set[str] = set()
-
-        def _collect(candidate: str) -> bool:
-            candidate = _unescape_img_url(candidate)
-            if _is_usable_img_url(candidate) and candidate not in seen:
-                seen.add(candidate)
-                urls.append(candidate)
-            return len(urls) >= limit
-
-        # ① 接口直接返回的原图列表（最可靠，优先使用）
-        origin = data.get("origin_image_urls")
-        if isinstance(origin, list):
-            for item in origin:
-                if isinstance(item, str) and _collect(item):
-                    return tuple(urls)
-
-        # ② 从正文 HTML 里提取（懒加载 data-src 优先，src 兜底）
-        for regex in (_ARTICLE_IMG_DATA_SRC_RE, _ARTICLE_IMG_SRC_RE):
-            for match in regex.finditer(content):
-                if _collect(match.group(1)):
-                    return tuple(urls)
-        return tuple(urls)
+            pass
+        try:
+            return await self._request_with_backoff(
+                _ARTICLE_VIEW_URL, {"id": article_id}, wbi=True,
+                max_attempts=2,
+            )
+        except BiliApiError as exc:
+            logger.debug("bili-api 专栏正文 %s 抓取失败：%s", article_id, exc)
+            return None
 
     async def fetch_dynamics(self, uid: str, *, limit: int = 5) -> list[UserDynamic]:
-        # 关键点：
-        # ① features=itemOpusStyle —— 否则 B 站不返回 opus 结构
-        # ② wbi=True —— 否则 B 站把 opus.summary 吞掉，正文凭空消失
-        data = await self._request_with_backoff(
-            _DYNAMIC_URL,
-            {
-                "host_mid": uid,
-                "timezone_offset": -480,
-                "offset": "",
-                "features": _DYNAMIC_FEATURES,
-            },
-            wbi=True,
-        )
-        items = data.get("items") if isinstance(data, dict) else None
-        if not isinstance(items, list):
-            return []
+        items = await self._fetch_dynamic_items(uid)
 
         parsed_items: list[UserDynamic] = []
         for raw in items:
@@ -528,6 +590,54 @@ class BiliSubscriptionClient:
         parsed_items.sort(key=lambda d: d.created_at, reverse=True)
 
         return parsed_items[:limit]
+
+    async def _fetch_dynamic_items(self, uid: str) -> list:
+        """抓 feed 原始 items，并对"空返回抖动"做少量重试。
+
+        关键点：
+        ① features=itemOpusStyle —— 否则 B 站不返回 opus 结构
+        ② wbi=True —— 否则 B 站把 opus.summary 吞掉，正文凭空消失
+
+        该接口会偶发返回 items=[]（同样的请求连续调用会 0/13 交替），
+        直接当成"没有新内容"会漏推，所以这里重试几次。
+        """
+        known_active = uid in self._active_feeds
+        attempts = (
+            _EMPTY_FEED_ATTEMPTS_ACTIVE if known_active
+            else _EMPTY_FEED_ATTEMPTS_FIRST
+        )
+        items: list = []
+        for attempt in range(attempts):
+            data = await self._request_with_backoff(
+                _DYNAMIC_URL,
+                {
+                    "host_mid": uid,
+                    "timezone_offset": -480,
+                    "offset": "",
+                    "features": _DYNAMIC_FEATURES,
+                },
+                wbi=True,
+            )
+            raw_items = data.get("items") if isinstance(data, dict) else None
+            items = raw_items if isinstance(raw_items, list) else []
+            if items:
+                self._remember_active_feed(uid)
+                return items
+            if attempt == attempts - 1:
+                break
+            logger.debug(
+                "bili-api UID %s 动态 feed 返回 0 条（接口抖动），"
+                "%.1fs 后重试（%d/%d）",
+                uid, _EMPTY_FEED_RETRY_DELAY, attempt + 2, attempts,
+            )
+            await asyncio.sleep(_EMPTY_FEED_RETRY_DELAY)
+        return items
+
+    def _remember_active_feed(self, uid: str) -> None:
+        self._active_feeds[uid] = None
+        if len(self._active_feeds) > _ACTIVE_FEED_CACHE_MAX:
+            for key in list(self._active_feeds)[: _ACTIVE_FEED_CACHE_MAX // 2]:
+                self._active_feeds.pop(key, None)
 
     async def enrich_dynamic(self, dynamic: UserDynamic) -> UserDynamic:
         """对"正文被吞"的动态用 detail 接口兜底，拿到正文后返回新对象。
@@ -560,6 +670,56 @@ class BiliSubscriptionClient:
             return None
         return _parse_dynamic(item)
 
+    async def fetch_opus_body(self, dynamic_id: str) -> OpusBody | None:
+        """抓 opus 网页的完整正文与全部正文图片（仅在 may_need_body 时调用）。
+
+        为什么不用 api：
+        feed / detail 接口对"正文被截断 + 图片被占位"的 opus 一律只回
+        摘要和 [图片]，正文图片在任何 api 字段里都不存在；opus 网页的
+        SSR 数据（__INITIAL_STATE__）才是完整的。
+
+        这是一个 www 域的 HTML 请求（不是 api 域），失败一律返回 None，
+        绝不影响主流程。
+        """
+        if not dynamic_id:
+            return None
+        if self.in_cooldown():
+            # 风控冷却期同样不发请求，避免"越封越试"
+            return None
+        headers = self._base_headers(
+            referer=f"{WEB_ORIGIN}/opus/{dynamic_id}"
+        )
+        headers["Accept"] = (
+            "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+        )
+        try:
+            await self._throttle()
+            async with self._session.get(
+                _OPUS_PAGE_URL.format(dynamic_id=dynamic_id),
+                headers=headers,
+                timeout=aiohttp.ClientTimeout(total=20),
+            ) as resp:
+                if resp.status >= 400:
+                    logger.debug(
+                        "bili-api opus 正文 %s 抓取失败：HTTP %s",
+                        dynamic_id, resp.status,
+                    )
+                    return None
+                page = await resp.text()
+        except Exception as exc:
+            logger.debug("bili-api opus 正文 %s 抓取异常：%s", dynamic_id, exc)
+            return None
+
+        body = _parse_opus_page(page)
+        if body is None:
+            logger.debug("bili-api opus 正文 %s 未能从网页里解析出内容", dynamic_id)
+        else:
+            logger.debug(
+                "bili-api opus 正文 %s 补齐：正文 %d 字 / 正文图 %d 张",
+                dynamic_id, len(body.text), len(body.image_urls),
+            )
+        return body
+
     # ------------------------------------------------------------------
     # 登录态检测
     # ------------------------------------------------------------------
@@ -581,7 +741,12 @@ class BiliSubscriptionClient:
 
         失败返回 False，不影响主流程。
         """
+        if self.in_cooldown():
+            logger.debug("bili-api 风控冷却中，跳过 bili_ticket 刷新")
+            return False
         try:
+            # 同样走全局节流：这个接口也参与风控判定，不能插队
+            await self._throttle()
             cookies = await fetch_bili_ticket(self._session)
         except Exception as exc:
             logger.debug("bili-api 刷新 bili_ticket 失败：%s", exc)
@@ -967,6 +1132,15 @@ class BiliSubscriptionClient:
     async def _request(
         self, url: str, params: Mapping[str, Any], *, wbi: bool
     ) -> dict[str, Any]:
+        # 冷却期内不再对 B 站发接口请求，避免"越封越试"。
+        # 冷却是全局的：无论后台轮询、手动命令还是推流前的信息补全，
+        # 一律先让路。
+        if self.in_cooldown():
+            raise BiliApiError(
+                f"B 站风控冷却中（剩余 {self.cooldown_remaining_seconds()} 秒），"
+                "已暂停接口请求",
+                code=-352,
+            )
         # 先解析 WBI 签名（必要时会先请求 _NAV_URL 拿密钥，
         # 该请求本身也会经过 _throttle），再在真正发请求前节流一次。
         final_params = dict(params)
@@ -1028,10 +1202,6 @@ class BiliSubscriptionClient:
         for attempt in range(max_attempts):
             try:
                 result = await self._request(url, params, wbi=wbi)
-                # 成功：重置风控计数 + 达到阈值才恢复节流间隔
-                self._risk_streak = 0
-                self._speed_up()
-                return result
             except BiliApiError as exc:
                 last_exc = exc
                 if exc.code not in _RETRYABLE_CODES:
@@ -1048,12 +1218,34 @@ class BiliSubscriptionClient:
                         await self._maybe_refresh_ticket()
                 if attempt == max_attempts - 1:
                     break
-                delay = _BACKOFF_DELAYS[min(attempt, len(_BACKOFF_DELAYS) - 1)]
-                logger.warning(
-                    "bili-subscription B 站限流（code=%s），%.0f 秒后重试（%d/%d）",
-                    exc.code, delay, attempt + 1, max_attempts,
-                )
+                if exc.code in _RISK_CONTROL_CODES:
+                    # 风控拦截：只做一次短探测，不再连续重试
+                    if attempt >= 1:
+                        break
+                    delay = _RISK_RETRY_DELAY_SECONDS
+                    logger.warning(
+                        "bili-subscription 遭遇风控（code=%s），"
+                        "%.0f 秒后仅再探测一次（避免加重风控）",
+                        exc.code, delay,
+                    )
+                else:
+                    delay = _BACKOFF_DELAYS[
+                        min(attempt, len(_BACKOFF_DELAYS) - 1)
+                    ]
+                    logger.warning(
+                        "bili-subscription B 站限流（code=%s），"
+                        "%.0f 秒后重试（%d/%d）",
+                        exc.code, delay, attempt + 1, max_attempts,
+                    )
                 await asyncio.sleep(delay)
+                continue
+
+            # 成功：达到阈值才恢复节流间隔。
+            # 注意这里**不能**清空风控计数：一轮检查里多个订阅并发，
+            # 单个请求成功就把计数清零的话，熔断冷却永远不会触发，
+            # 结果是一直在被风控的状态下反复请求，越封越狠。
+            self._speed_up()
+            return result
         assert last_exc is not None
         raise last_exc
 
@@ -1196,6 +1388,280 @@ def _to_int(value: Any, default: int = 0) -> int:
         return default
 
 
+def _img_dedupe_key(url: str) -> str:
+    """图片去重用的键：忽略协议与 B 站的尺寸后缀。
+
+    同一张图在不同接口里可能是 ``http://i0.hdslb.com/x.png``、
+    ``//i0.hdslb.com/x.png`` 或带 ``@1192w`` 缩略后缀的形式，
+    直接按字符串比较会把同一张图当成两张（卡片里就会出现重复图）。
+    """
+    key = str(url or "").strip()
+    if key.startswith("//"):
+        key = key[2:]
+    elif "://" in key:
+        key = key.split("://", 1)[1]
+    return key.split("@", 1)[0].casefold()
+
+
+def _dedupe_urls(urls: list[str]) -> tuple[str, ...]:
+    """按顺序去重合法图片 URL，并限制在单条动态的图片上限内。"""
+    seen: set[str] = set()
+    result: list[str] = []
+    for url in urls:
+        candidate = str(url or "").strip()
+        if not candidate:
+            continue
+        if candidate.startswith("//"):
+            candidate = "https:" + candidate
+        if not _is_usable_img_url(candidate):
+            continue
+        key = _img_dedupe_key(candidate)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        result.append(candidate)
+        if len(result) >= _MAX_DYNAMIC_IMAGES:
+            break
+    return tuple(result)
+
+
+def _article_image_urls(data: Mapping[str, Any], *, limit: int = 6) -> tuple[str, ...]:
+    """从 x/article/view 的返回里取正文插图 URL。
+
+    ① origin_image_urls 是接口直接给出的原图列表（最可靠，优先使用）；
+    ② 再从正文 HTML 里提取（懒加载 data-src 优先，src 兜底）。
+    """
+    urls: list[str] = []
+    seen: set[str] = set()
+
+    def collect(candidate: str) -> bool:
+        candidate = _unescape_img_url(candidate)
+        if _is_usable_img_url(candidate) and candidate not in seen:
+            seen.add(candidate)
+            urls.append(candidate)
+        return len(urls) >= limit
+
+    origin = data.get("origin_image_urls")
+    if isinstance(origin, list):
+        for item in origin:
+            if isinstance(item, str) and collect(item):
+                return tuple(urls)
+
+    content = data.get("content")
+    if isinstance(content, str):
+        for regex in (_ARTICLE_IMG_DATA_SRC_RE, _ARTICLE_IMG_SRC_RE):
+            for match in regex.finditer(content):
+                if collect(match.group(1)):
+                    return tuple(urls)
+    return tuple(urls)
+
+
+def merge_image_urls(*groups: Iterable[str]) -> tuple[str, ...]:
+    """把多组图片 URL 按顺序合并去重（忽略协议差异），并限制在上限内。"""
+    flat: list[str] = []
+    for group in groups:
+        flat.extend(group)
+    return _dedupe_urls(flat)
+
+
+def _html_to_text(raw: Any) -> str:
+    """把专栏正文 HTML 转成纯文本（保留段落换行，去掉标签与实体）。"""
+    if not isinstance(raw, str) or not raw:
+        return ""
+    text = re.sub(r"<\s*br\s*/?\s*>", "\n", raw, flags=re.IGNORECASE)
+    text = re.sub(
+        r"</\s*(?:p|div|figure|figcaption|h[1-6]|li|ul|ol|blockquote|tr)\s*>",
+        "\n", text, flags=re.IGNORECASE,
+    )
+    text = re.sub(r"<[^>]+>", "", text)
+    text = html.unescape(text)
+    text = text.replace("\u200b", "").replace("\xa0", " ")
+
+    lines: list[str] = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped:
+            lines.append(stripped)
+        elif lines and lines[-1] != "":
+            lines.append("")
+    return "\n".join(lines).strip()
+
+
+def strip_image_placeholders(text: str) -> str:
+    """去掉正文里的 ``[图片]`` 占位符。
+
+    feed/detail 接口会把正文图片替换成这个占位符；图片本身会作为卡片配图
+    画出来，正文里再留一行 ``[图片]`` 只是噪音。
+    """
+    if not text or _IMAGE_PLACEHOLDER not in text:
+        return text
+    lines: list[str] = []
+    for line in text.splitlines():
+        if line.strip() in (_IMAGE_PLACEHOLDER, "［图片］"):
+            continue
+        cleaned = line.replace(_IMAGE_PLACEHOLDER, "").rstrip()
+        if cleaned:
+            lines.append(cleaned)
+        elif lines and lines[-1] != "":
+            lines.append("")
+    return "\n".join(lines).strip()
+
+
+def _pic_url(node: Any) -> str:
+    """取 SSR/接口图片节点里的 URL（兼容字符串与 {url: ...}）。"""
+    if isinstance(node, Mapping):
+        raw = str(node.get("url") or node.get("src") or "").strip()
+    elif isinstance(node, str):
+        raw = node.strip()
+    else:
+        return ""
+    if not raw:
+        return ""
+    if raw.startswith("//"):
+        raw = "https:" + raw
+    return raw if _is_usable_img_url(raw) else ""
+
+
+def _paragraph_text(paragraph: Mapping[str, Any]) -> str:
+    """取 SSR 段落里的文字（文本节点拼接）。"""
+    text = paragraph.get("text")
+    if isinstance(text, str):
+        return text.strip()
+    if not isinstance(text, Mapping):
+        return ""
+    nodes = text.get("nodes")
+    if not isinstance(nodes, list):
+        return ""
+    parts: list[str] = []
+    for node in nodes:
+        if not isinstance(node, Mapping):
+            continue
+        word = node.get("word")
+        if isinstance(word, Mapping):
+            parts.append(str(word.get("words") or ""))
+            continue
+        for key in ("rich", "formula", "user"):
+            block = node.get(key)
+            if isinstance(block, Mapping):
+                block_text = (
+                    block.get("text") or block.get("orig_text")
+                    or block.get("words") or block.get("name")
+                )
+                if block_text:
+                    parts.append(str(block_text))
+    return "".join(parts).strip()
+
+
+def _module_title(raw: Any) -> str:
+    """取 MODULE_TYPE_TITLE 的标题文本。"""
+    if isinstance(raw, str):
+        return raw.strip()
+    if isinstance(raw, Mapping):
+        for key in ("text", "title", "name"):
+            value = raw.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    return ""
+
+
+def _parse_opus_page(raw_html: str) -> OpusBody | None:
+    """从 opus 网页 HTML 的 ``__INITIAL_STATE__`` 里解析完整正文。
+
+    结构（实测）::
+
+        state.detail.modules = [
+          {module_type: MODULE_TYPE_TITLE,   module_title: {...}},
+          {module_type: MODULE_TYPE_AUTHOR,  module_author: {name, face, pub_ts}},
+          {module_type: MODULE_TYPE_TOP,     module_top.display.album.pics: [...]},
+          {module_type: MODULE_TYPE_CONTENT, module_content.paragraphs: [
+              {para_type: 1, text: {nodes: [{word: {words: ...}}]}},
+              {para_type: 2, pic: {pics: [{url: ...}]}},
+          ]},
+        ]
+
+    解析失败一律返回 None。
+    """
+    if not raw_html:
+        return None
+    match = _INITIAL_STATE_RE.search(raw_html)
+    if match is None:
+        return None
+    try:
+        state = json.loads(match.group(1))
+    except (json.JSONDecodeError, ValueError):
+        return None
+    detail = state.get("detail") if isinstance(state, Mapping) else None
+    if not isinstance(detail, Mapping):
+        return None
+    modules = detail.get("modules")
+    if not isinstance(modules, list):
+        return None
+
+    title = ""
+    author_name = ""
+    author_face = ""
+    created_at = 0
+    lines: list[str] = []
+    images: list[str] = []
+    covers: list[str] = []
+
+    for module in modules:
+        if not isinstance(module, Mapping):
+            continue
+        module_type = str(module.get("module_type") or "")
+        if module_type == "MODULE_TYPE_TITLE":
+            title = _module_title(module.get("module_title"))
+        elif module_type == "MODULE_TYPE_AUTHOR":
+            author = module.get("module_author")
+            if isinstance(author, Mapping):
+                author_name = str(author.get("name") or "").strip()
+                author_face = _pic_url(author.get("face"))
+                created_at = _to_int(author.get("pub_ts"))
+        elif module_type == "MODULE_TYPE_TOP":
+            top = module.get("module_top")
+            display = top.get("display") if isinstance(top, Mapping) else None
+            album = display.get("album") if isinstance(display, Mapping) else None
+            pics = album.get("pics") if isinstance(album, Mapping) else None
+            if isinstance(pics, list):
+                for pic in pics:
+                    url = _pic_url(pic)
+                    if url:
+                        covers.append(url)
+        elif module_type == "MODULE_TYPE_CONTENT":
+            content = module.get("module_content")
+            paragraphs = (
+                content.get("paragraphs") if isinstance(content, Mapping) else None
+            )
+            if not isinstance(paragraphs, list):
+                continue
+            for paragraph in paragraphs:
+                if not isinstance(paragraph, Mapping):
+                    continue
+                paragraph_text = _paragraph_text(paragraph)
+                if paragraph_text:
+                    lines.append(paragraph_text)
+                pic = paragraph.get("pic")
+                pics = pic.get("pics") if isinstance(pic, Mapping) else None
+                if isinstance(pics, list):
+                    for item in pics:
+                        url = _pic_url(item)
+                        if url:
+                            images.append(url)
+
+    text = "\n".join(lines).strip()
+    if not text and not images and not covers:
+        return None
+    return OpusBody(
+        text=text,
+        image_urls=_dedupe_urls(images),
+        cover_urls=_dedupe_urls(covers),
+        title=title,
+        author_name=author_name,
+        author_face=author_face,
+        created_at=created_at,
+    )
+
+
 def _parse_duration(text: str) -> int:
     parts = text.strip().split(":")
     if not parts or not all(p.isdigit() for p in parts):
@@ -1317,6 +1783,9 @@ def _parse_dynamic(raw: Any, _depth: int = 0) -> UserDynamic | None:
     dynamic = modules.get("module_dynamic") if isinstance(modules, Mapping) else {}
     text = ""
     image_urls: list[str] = []
+    title = ""
+    summary_truncated = False
+    article_id = ""
 
     if isinstance(dynamic, Mapping):
         # 1) 旧结构：module_dynamic.desc.text
@@ -1332,6 +1801,11 @@ def _parse_dynamic(raw: Any, _depth: int = 0) -> UserDynamic | None:
                 opus_text = _extract_opus_text(opus)
                 if opus_text and not text:
                     text = opus_text
+                title = str(opus.get("title") or "").strip()
+                summary = opus.get("summary")
+                if isinstance(summary, Mapping) and summary.get("has_more"):
+                    # 摘要被截断：完整正文只能去 opus 网页拿
+                    summary_truncated = True
                 pics = opus.get("pics")
                 if isinstance(pics, list):
                     for pic in pics:
@@ -1341,14 +1815,19 @@ def _parse_dynamic(raw: Any, _depth: int = 0) -> UserDynamic | None:
             # 3) 专栏卡片
             article = major.get("article")
             if isinstance(article, Mapping):
-                title = str(article.get("title") or "").strip()
-                summary = str(article.get("desc") or "").strip()
-                if title and summary:
-                    article_text = f"{title}\n\n{summary}"
+                article_title = str(article.get("title") or "").strip()
+                article_summary = str(article.get("desc") or "").strip()
+                if article_title and article_summary:
+                    article_text = f"{article_title}\n\n{article_summary}"
                 else:
-                    article_text = title or summary
+                    article_text = article_title or article_summary
                 if article_text and not text:
                     text = article_text
+                if not title:
+                    title = article_title
+                article_id = str(
+                    article.get("id") or article.get("cvid") or ""
+                ).strip()
                 covers = article.get("covers")
                 if isinstance(covers, list):
                     for c in covers:
@@ -1363,6 +1842,13 @@ def _parse_dynamic(raw: Any, _depth: int = 0) -> UserDynamic | None:
                         if isinstance(item, Mapping):
                             _append_image_url(image_urls, item.get("src"))
 
+    # 5) "专栏动态"（DYNAMIC_TYPE_ARTICLE）：正文本体是专栏，cv 号在 basic.rid_str
+    basic = raw.get("basic") if isinstance(raw.get("basic"), Mapping) else {}
+    if not article_id and kind == "DYNAMIC_TYPE_ARTICLE":
+        rid = str(basic.get("rid_str") or "").strip()
+        if rid.isdigit():
+            article_id = rid
+
     # 转发动态：把原动态的文字/图片一并带出（只解析一层，防止递归爆炸）
     if kind == "DYNAMIC_TYPE_FORWARD" and _depth < 1:
         orig_raw = raw.get("orig")
@@ -1374,12 +1860,13 @@ def _parse_dynamic(raw: Any, _depth: int = 0) -> UserDynamic | None:
                 if not image_urls:
                     image_urls = list(orig_parsed.image_urls)
 
-    # 去重
+    # 去重（忽略协议差异：http:// 与 // 指向的是同一张图）
     seen: set[str] = set()
     unique_images: list[str] = []
     for url in image_urls:
-        if url not in seen:
-            seen.add(url)
+        key = _img_dedupe_key(url)
+        if key and key not in seen:
+            seen.add(key)
             unique_images.append(url)
 
     # 作者信息
@@ -1391,10 +1878,13 @@ def _parse_dynamic(raw: Any, _depth: int = 0) -> UserDynamic | None:
         if author_face and not author_face.startswith("http"):
             author_face = f"https:{author_face}"
 
+    # 正文被截断（has_more）或图片被占位成 [图片]：需要抓 opus 网页正文
+    may_need_body = bool(summary_truncated or _IMAGE_PLACEHOLDER in text)
+
     return UserDynamic(
         dynamic_id=dynamic_id,
         text=text,
-        image_urls=tuple(unique_images[:6]),
+        image_urls=tuple(unique_images[:_MAX_DYNAMIC_IMAGES]),
         created_at=created_at,
         kind=kind,
         is_original_video=(kind == "DYNAMIC_TYPE_AV"),
@@ -1403,4 +1893,12 @@ def _parse_dynamic(raw: Any, _depth: int = 0) -> UserDynamic | None:
         kind_cn=_KIND_CN.get(kind, "动态"),
         # 正文为空且结构疑似"正文被吞"时，推送前可做一次 detail 兜底
         may_need_detail=(not text and _maybe_needs_detail(raw)),
+        title=title,
+        article_id=article_id,
+        may_need_body=may_need_body,
+        # 专栏动态的正文图都是长图，整宽单列才看得清；
+        # 图文动态的相册图按 B 站网格拼（两列/三列）
+        image_layout=(
+            "column" if kind == "DYNAMIC_TYPE_ARTICLE" else "grid"
+        ),
     )

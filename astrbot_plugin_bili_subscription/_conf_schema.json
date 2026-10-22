@@ -115,6 +115,12 @@
     "default": "",
     "hint": "留空时自动按「中文 → 韩文(malgun) → 日文(YuGoth/Meiryo) → emoji(Segoe UI Emoji)」的顺序\n探测系统字体；缺失的字形会自动回退到下一款字体，韩文/日文/emoji 不再显示方块，\n正常情况下无需设置。\n若个别字符仍显示方块，可指定一款全量字体的路径\n（如思源黑体 SourceHanSans / Noto Sans CJK / Sarasa Gothic 的 .ttf 或 .ttc）。"
   },
+  "enrich_body": {
+    "description": "补齐正文（动态正文图 / 专栏全文）",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后，推送前会按需补齐被接口吞掉的内容：\n· 「专栏动态」的正文图片（接口只返回 [图片] 占位符，图片本身在 opus 网页里）；\n· 被截断的正文全文（has_more）；\n· 专栏（cv）的正文全文与正文插图（列表接口只给摘要）。\n\n只有真正要推送的条目才会触发，且每条最多 1 次网页请求，不影响后台轮询开销。\n如果你遇到 B 站频繁风控、想尽量减少请求，可以关掉（代价是正文图/全文可能缺失）。"
+  },
   "enable_video_push": {
     "description": "是否推送视频",
     "type": "bool",

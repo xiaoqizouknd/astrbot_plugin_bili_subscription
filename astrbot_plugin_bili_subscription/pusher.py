@@ -25,7 +25,7 @@ from __future__ import annotations
 import asyncio
 import time
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from functools import partial
 from typing import Any
 
@@ -33,9 +33,12 @@ from astrbot.api import logger
 
 from .bili_api import (
     BiliSubscriptionClient,
+    OpusBody,
     UserArticle,
     UserDynamic,
     UserVideo,
+    merge_image_urls,
+    strip_image_placeholders,
 )
 from .render import render_card, render_dynamic_card
 from .subscription import (
@@ -90,6 +93,10 @@ _FAIL_COUNT_MAX_KEYS = 500
 _FAIL_RETRY_SECONDS = 120
 # bili_ticket 刷新间隔（秒）：约 3 天有效，每天刷一次
 _TICKET_REFRESH_SECONDS = 86400
+# 单条推送最多下载/绘制多少张图（与 bili_api 的相册上限一致）
+_MAX_PUSH_IMAGES = 9
+# 专栏正文一次最多取回多少张插图
+_ARTICLE_IMAGE_LIMIT = 9
 
 
 def is_empty_dynamic(dynamic: UserDynamic) -> bool:
@@ -101,6 +108,38 @@ def is_empty_dynamic(dynamic: UserDynamic) -> bool:
     if dynamic.image_urls:
         return False
     return True
+
+
+def merge_opus_body(dynamic: UserDynamic, body: OpusBody) -> UserDynamic:
+    """把 opus 网页抓到的完整正文合并进动态对象。
+
+    合并规则：
+    - 正文优先用网页里的段落文本（feed 的摘要是被截断的，还可能带 [图片]
+      占位符），按 B 站的显示顺序拼成"标题 + 正文"；
+    - 图片按"feed 里的封面/相册图 → 网页顶部大图 → 正文图"的顺序去重合并，
+      上限 _MAX_PUSH_IMAGES 张；
+    - 作者/时间以 feed 为准，缺失时用网页里的补上。
+    """
+    title = body.title or dynamic.title
+    if body.text:
+        text = f"{title}\n\n{body.text}" if title else body.text
+    else:
+        text = dynamic.text
+
+    images = merge_image_urls(
+        dynamic.image_urls, body.cover_urls, body.image_urls
+    )
+
+    return replace(
+        dynamic,
+        text=text,
+        title=title,
+        image_urls=images[:_MAX_PUSH_IMAGES],
+        author_name=dynamic.author_name or body.author_name,
+        author_face=dynamic.author_face or body.author_face,
+        created_at=dynamic.created_at or body.created_at,
+        may_need_body=False,
+    )
 
 
 _GIF_MAGIC = (b"GIF87a", b"GIF89a")
@@ -138,6 +177,7 @@ class SubscriptionPusher:
         quiet_enabled: bool = False,
         quiet_start_minutes: int | None = None,
         quiet_end_minutes: int | None = None,
+        enrich_body: bool = True,
     ) -> None:
         self._client = client
         self._store = store
@@ -156,6 +196,8 @@ class SubscriptionPusher:
         self._retry_failed_push = retry_failed_push
         self._max_retries = max(1, max_retries)
         self._config_refresher = config_refresher
+        # 是否在推送前补齐正文（动态正文图 / 专栏全文）
+        self._enrich_body = enrich_body
 
         # 静音时段（分钟数，从 0 点起算）
         self._quiet_enabled = quiet_enabled
@@ -240,6 +282,7 @@ class SubscriptionPusher:
         quiet_enabled: bool = False,
         quiet_start_minutes: int | None = None,
         quiet_end_minutes: int | None = None,
+        enrich_body: bool = True,
     ) -> None:
         """热重载除订阅列表之外的开关，无需重启插件。"""
         self._enable_video_push = enable_video_push
@@ -253,6 +296,7 @@ class SubscriptionPusher:
         self._quiet_enabled = quiet_enabled
         self._quiet_start = quiet_start_minutes
         self._quiet_end = quiet_end_minutes
+        self._enrich_body = enrich_body
 
     def start(self) -> None:
         if self._task is None or self._task.done():
@@ -278,6 +322,13 @@ class SubscriptionPusher:
         即使 ``enable_video_push=False`` 也会拉一次视频接口，
         以便"订阅检查"能反映真实抓取情况。
         """
+        if self._client.in_cooldown():
+            remaining = self._client.cooldown_remaining_seconds()
+            return [
+                "当前处于 B 站风控冷却期，已暂停接口请求（避免越封越狠）。",
+                f"剩余约 {remaining // 60 + 1} 分钟，冷却结束后自动恢复。",
+                "提示：风控期间反复手动检查只会延长被封时间，建议先等一会儿。",
+            ]
         report: list[str] = []
         for sub in self._subscriptions:
             report.append(f"== UID {sub.uid} ==")
@@ -380,6 +431,12 @@ class SubscriptionPusher:
         return ["视频推送失败"]
 
     async def dry_run(self) -> list[str]:
+        if self._client.in_cooldown():
+            return [
+                "当前处于 B 站风控冷却期，干跑同样需要请求接口，已跳过。",
+                f"剩余约 {self._client.cooldown_remaining_seconds() // 60 + 1} "
+                "分钟，冷却结束后再试。",
+            ]
         report: list[str] = []
         for sub in self._subscriptions:
             report.append(f"== UID {sub.uid} ==")
@@ -959,14 +1016,7 @@ class SubscriptionPusher:
     async def _push_dynamic(
         self, sub: Subscription, dynamic: UserDynamic, sessions: tuple[str, ...]
     ) -> SendOutcome:
-        # 正文为空的动态：先尝试 detail 接口兜底一次（按需，不浪费请求）
-        if not dynamic.text and dynamic.may_need_detail:
-            try:
-                dynamic = await self._client.enrich_dynamic(dynamic)
-            except Exception:
-                logger.exception(
-                    "bili-subscription 动态正文兜底失败：%s", dynamic.dynamic_id
-                )
+        dynamic = await self._complete_dynamic(dynamic)
 
         image_bytes = await self._download_images(dynamic.image_urls)
         # 顺带下载头像，用于新卡片头部（失败不影响主流程）
@@ -987,6 +1037,7 @@ class SubscriptionPusher:
             images=image_bytes,
             footer=f"https://t.bilibili.com/{dynamic.dynamic_id}",
             font_path=self._font_path,
+            layout=dynamic.image_layout,
         )
         # 卡片渲染失败（如未装 Pillow）时，正文用文字消息兜底，避免只剩原图
         prefix_text: str | None = None
@@ -1000,22 +1051,78 @@ class SubscriptionPusher:
             prefix_text=prefix_text,
         )
 
+    async def _complete_dynamic(self, dynamic: UserDynamic) -> UserDynamic:
+        """推送前补齐动态正文。
+
+        两步，都是"按需"的（只有真要推送的动态才会产生请求）：
+        ① 正文为空且结构疑似被吞 → detail 接口兜底；
+        ② 正文被截断（has_more）或图片被占位成 [图片] → 抓一次 opus 网页，
+           拿到完整段落和全部正文图片。
+
+        任何一步失败都退回原有信息，绝不阻塞推送。
+        """
+        if not dynamic.text and dynamic.may_need_detail:
+            try:
+                dynamic = await self._client.enrich_dynamic(dynamic)
+            except Exception:
+                logger.exception(
+                    "bili-subscription 动态正文兜底失败：%s", dynamic.dynamic_id
+                )
+
+        if self._enrich_body and dynamic.may_need_body:
+            body = None
+            try:
+                body = await self._client.fetch_opus_body(dynamic.dynamic_id)
+            except Exception:
+                logger.exception(
+                    "bili-subscription 动态正文补齐失败：%s", dynamic.dynamic_id
+                )
+            if body is not None:
+                before = len(dynamic.image_urls)
+                dynamic = merge_opus_body(dynamic, body)
+                logger.info(
+                    "bili-subscription 动态 %s 已补齐正文（原图 %d → %d 张）",
+                    dynamic.dynamic_id, before, len(dynamic.image_urls),
+                )
+
+        # 图片占位符：图片本身会画在卡片里，正文里再留一行 [图片] 只是噪音
+        if dynamic.image_urls and "[图片]" in dynamic.text:
+            dynamic = replace(
+                dynamic, text=strip_image_placeholders(dynamic.text)
+            )
+        return dynamic
+
     async def _push_article(
         self, sub: Subscription, article: UserArticle, sessions: tuple[str, ...]
     ) -> SendOutcome:
-        # 优先用正文插图（原文里的图）；抓取失败/为空时才退回封面兜底
-        try:
-            content_urls = await self._client.fetch_article_content_images(
-                article.article_id, limit=6
-            )
-        except Exception as exc:
-            logger.warning(
-                "bili-subscription 专栏 %s 正文插图抓取失败：%s",
-                article.article_id, exc,
-            )
-            content_urls = ()
+        # 一次请求同时拿正文全文与正文插图；失败/为空时退回列表接口的摘要+封面
+        body_text = ""
+        content_urls: tuple[str, ...] = ()
+        if self._enrich_body:
+            try:
+                body = await self._client.fetch_article_body(
+                    article.article_id, limit=_ARTICLE_IMAGE_LIMIT
+                )
+                body_text, content_urls = body.text, body.image_urls
+            except Exception as exc:
+                logger.warning(
+                    "bili-subscription 专栏 %s 正文抓取失败：%s",
+                    article.article_id, exc,
+                )
+        else:
+            try:
+                content_urls = await self._client.fetch_article_content_images(
+                    article.article_id, limit=_ARTICLE_IMAGE_LIMIT
+                )
+            except Exception as exc:
+                logger.warning(
+                    "bili-subscription 专栏 %s 正文插图抓取失败：%s",
+                    article.article_id, exc,
+                )
+                content_urls = ()
+
         if content_urls:
-            image_bytes = await self._download_images(content_urls[:6])
+            image_bytes = await self._download_images(content_urls)
         else:
             logger.info(
                 "bili-subscription 专栏 %s 未取到正文插图，回退为封面",
@@ -1023,13 +1130,19 @@ class SubscriptionPusher:
             )
             image_bytes = await self._download_images(article.covers)
 
-        body = f"{article.title}\n\n{article.summary}"
+        # 正文优先用抓到的全文；抓不到才退回列表接口的摘要
+        text = body_text or article.summary
+        body_text_for_card = (
+            f"{article.title}\n\n{text}" if text else article.title
+        )
         card = await render_card(
             title="B 站专栏更新",
-            body=body,
+            body=body_text_for_card,
             images=image_bytes,
             footer=f"https://www.bilibili.com/read/cv{article.article_id}",
             font_path=self._font_path,
+            # 专栏正文图都是长图，整宽单列才看得清
+            layout="column",
         )
         return await self._broadcast(
             sessions, card, image_bytes,
@@ -1080,7 +1193,7 @@ class SubscriptionPusher:
         """
         if not urls:
             return []
-        tasks = [self._client.download_image(u) for u in urls[:6]]
+        tasks = [self._client.download_image(u) for u in urls[:_MAX_PUSH_IMAGES]]
         results = await asyncio.gather(*tasks, return_exceptions=True)
         out: list[bytes] = []
         for r in results:

@@ -14,6 +14,18 @@
 4. 纯文字卡片用 PNG，保证文字锐利。
 
 这样单张图不再有独立上限，整张卡片有统一上限兜底。
+
+多图排版（layout）：
+- ``grid``：按 B 站相册的网格规则拼（1 张整宽 / 2、4 张两列 / 3、5~9 张三列），
+  也就是群里看到的"原动态几张小图拼成一张大图"，不再逐张纵向堆叠；
+- ``column``：正文长图（专栏动态、公告 1/5~5/5 这类）整宽单列，和 B 站
+  正文的显示一致，长图里的字才看得清；
+- ``auto``：按图片长宽比判断——多张都是竖长图就走单列，否则走网格。
+
+注意：这里**不再猜测**"几张独立图是同一张大图的切片"然后竖着/横着拼起来。
+那种猜测在"多张同宽的独立长图"上必然误判（拼成一张超长图，再被高度上限
+压成看不清的小图），B 站自己的网格/单列排版已经能把"小图拼大图"的观感
+还原出来。
 """
 
 from __future__ import annotations
@@ -94,6 +106,11 @@ _MAX_IMAGE_HEIGHT = 1600
 
 # 多图网格排版的间距
 _GRID_GAP = 12
+
+# auto 排版下判定"竖长图"的长宽比阈值（高/宽）。
+# 阈值贴近 1：B 站正文里的"长图"经常只是略高于正方形（如实测 1950×2008），
+# 一旦按网格排进三列单元格，图里的字就小到看不清了。
+_LONG_IMAGE_RATIO = 1.05
 
 # 整张卡片（含所有嵌入图）的字节上限
 _CARD_MAX_BYTES = 2 * 1024 * 1024
@@ -316,17 +333,18 @@ async def render_card(
     images: list[bytes],
     footer: str = "",
     font_path: str | None = None,
+    layout: str = "auto",
 ) -> bytes | None:
     if not _PIL_AVAILABLE:
         return None
     return await asyncio.to_thread(
-        _render_sync, title, body, images, footer, font_path
+        _render_sync, title, body, images, footer, font_path, layout
     )
 
 
 def _render_sync(
     title: str, body: str, images: list[bytes],
-    footer: str, font_path: str | None,
+    footer: str, font_path: str | None, layout: str = "auto",
 ) -> bytes | None:
     title_stack = _load_font_stack(28, font_path)
     body_stack = _load_font_stack(20, font_path)
@@ -350,7 +368,7 @@ def _render_sync(
     image_budget = max(0, _CARD_MAX_HEIGHT - fixed_height)
     scaled_images, image_area_height = _prepare_images(
         images, max_text_width, height_budget=image_budget or None,
-        grid=True,
+        layout=layout,
     )
 
     total_height = fixed_height + image_area_height
@@ -365,7 +383,9 @@ def _render_sync(
         y += line_height
     y += 12
     for img in scaled_images:
-        canvas.paste(img, (_PADDING, y))
+        # 被高度预算缩过的图居中摆放，避免右侧留一大块空白
+        x = _PADDING + max(0, (max_text_width - img.width) // 2)
+        canvas.paste(img, (x, y))
         y += img.height + 12
     if footer:
         _draw_text(draw, (_PADDING, y), footer, footer_stack, _SECONDARY_TEXT)
@@ -386,13 +406,14 @@ async def render_dynamic_card(
     images: list[bytes],
     footer: str = "",
     font_path: str | None = None,
+    layout: str = "auto",
 ) -> bytes | None:
     if not _PIL_AVAILABLE:
         return None
     return await asyncio.to_thread(
         _render_dynamic_sync,
         author_name, author_face, kind_cn, timestamp,
-        body, images, footer, font_path,
+        body, images, footer, font_path, layout,
     )
 
 
@@ -405,6 +426,7 @@ def _render_dynamic_sync(
     images: list[bytes],
     footer: str,
     font_path: str | None,
+    layout: str = "auto",
 ) -> bytes | None:
     name_stack = _load_font_stack(22, font_path)
     meta_stack = _load_font_stack(14, font_path)
@@ -434,7 +456,7 @@ def _render_dynamic_sync(
     image_budget = max(0, _CARD_MAX_HEIGHT - fixed_height)
     scaled_images, image_area_height = _prepare_images(
         images, max_text_width, height_budget=image_budget or None,
-        compose=True, grid=True,
+        layout=layout,
     )
 
     # ---- 总高 ----
@@ -490,7 +512,9 @@ def _render_dynamic_sync(
 
     # ---- 图片 ----
     for img in scaled_images:
-        canvas.paste(img, (_PADDING, y))
+        # 被高度预算缩过的图居中摆放，避免右侧留一大块空白
+        image_x = _PADDING + max(0, (max_text_width - img.width) // 2)
+        canvas.paste(img, (image_x, y))
         y += img.height + 12
 
     # ---- 页脚 ----
@@ -513,58 +537,6 @@ def _load_avatar(data: bytes | None, size: int) -> Image.Image | None:
         return None
 
 
-def _compose_tiles(images: list[Image.Image]) -> list[Image.Image]:
-    """把疑似同一张大图的切片拼回一张图。
-
-    判定规则：
-    - 四宫格/九宫格：张数为完全平方（4/9）且所有切片尺寸一致；
-    - 竖排长图：所有切片等宽（长截图被切成几段）；
-    - 横排宽图：所有切片等高（宽图被切成几段）。
-    其余情况保持原样，交给上层按普通多图处理。
-    """
-    n = len(images)
-    if n < 2:
-        return images
-    dims = [(im.width, im.height) for im in images]
-    widths = [d[0] for d in dims]
-    heights = [d[1] for d in dims]
-    same_w = all(w == widths[0] for w in widths)
-    same_h = all(h == heights[0] for h in heights)
-
-    # 九宫格 / 四宫格
-    if n in (4, 9) and same_w and same_h:
-        cols = 2 if n == 4 else 3
-        rows = n // cols
-        tile_w, tile_h = dims[0]
-        canvas = Image.new("RGB", (cols * tile_w, rows * tile_h), _BG_COLOR)
-        for index, img in enumerate(images):
-            row, col = divmod(index, cols)
-            canvas.paste(img, (col * tile_w, row * tile_h))
-        return [canvas]
-
-    # 竖排长图
-    if same_w:
-        total_h = sum(heights)
-        canvas = Image.new("RGB", (widths[0], total_h), _BG_COLOR)
-        y = 0
-        for img in images:
-            canvas.paste(img, (0, y))
-            y += img.height
-        return [canvas]
-
-    # 横排宽图
-    if same_h:
-        total_w = sum(widths)
-        canvas = Image.new("RGB", (total_w, heights[0]), _BG_COLOR)
-        x = 0
-        for img in images:
-            canvas.paste(img, (x, 0))
-            x += img.width
-        return [canvas]
-
-    return images
-
-
 def _decide_columns(count: int) -> int:
     """按常见图文排版习惯决定列数。
 
@@ -576,6 +548,26 @@ def _decide_columns(count: int) -> int:
     if count in (2, 4):
         return 2
     return 3
+
+
+def _resolve_columns(layout: str, images: list[Image.Image]) -> int:
+    """由 layout 决定列数。
+
+    - ``column``：单列整宽（正文长图）；
+    - ``grid``：B 站相册网格规则；
+    - 其他（``auto``）：多张都是竖长图时单列，否则按网格。
+    """
+    if not images:
+        return 1
+    if layout == "column":
+        return 1
+    if layout == "grid":
+        return _decide_columns(len(images))
+    if len(images) > 1 and all(
+        img.height >= img.width * _LONG_IMAGE_RATIO for img in images
+    ):
+        return 1
+    return _decide_columns(len(images))
 
 
 def _fit_cell(img: Image.Image, cell_width: int) -> tuple[Image.Image, int, int]:
@@ -594,18 +586,16 @@ def _prepare_images(
     max_width: int,
     *,
     height_budget: int | None = None,
-    compose: bool = False,
-    grid: bool = False,
+    layout: str = "auto",
 ) -> tuple[list[Image.Image], int]:
     """只做缩放，不做单独压缩。
 
     这样最终只有一次 JPEG 编码（_save_canvas 里的），画质和 CPU 都更优。
     height_budget 是图片区域（含间距）的总高预算；超预算时整体等比缩小，
     保证卡片总高不会超过平台拒收的尺寸。
-    compose=True 时（图文动态），若多张图是同一张大图的切片，先拼回一张
-    大图再缩放，直观呈现"几张小图拼成的大图"。
-    grid=True 时多图按网格横排（1 张整宽 / 2、4 张两列 / 其余三列），
-    避免多图纵向堆叠导致卡片过高。
+
+    layout 决定多图排布：``grid``（B 站相册网格）/ ``column``（长图整宽单列）/
+    ``auto``（按长宽比判断）。单列时返回多张图，网格时拼成一张画布返回。
     """
     decoded: list[Image.Image] = []
     for data in images:
@@ -613,12 +603,10 @@ def _prepare_images(
             decoded.append(Image.open(io.BytesIO(data)).convert("RGB"))
         except Exception:
             continue
-    if compose:
-        decoded = _compose_tiles(decoded)
     if not decoded:
         return [], 0
 
-    columns = _decide_columns(len(decoded)) if grid else 1
+    columns = _resolve_columns(layout, decoded)
     if columns <= 1 or len(decoded) == 1:
         return _layout_column(decoded, max_width, height_budget)
 
@@ -650,15 +638,17 @@ def _prepare_images(
 
     y = 0
     for row, row_height in zip(rows, row_heights):
+        scaled_row_height = max(1, int(row_height * factor))
         for index, (img, w, h) in enumerate(row):
             new_w, new_h = max(1, int(w * factor)), max(1, int(h * factor))
             if (new_w, new_h) != img.size:
                 img = img.resize((new_w, new_h), _LANCZOS)
             x = index * (scaled_cell + _GRID_GAP)
-            # 图比单元格窄时居中，视觉更整齐
+            # 图比单元格窄/矮时居中，视觉更整齐
             x += max(0, (scaled_cell - new_w) // 2)
-            canvas.paste(img, (x, y))
-        y += max(1, int(row_height * factor)) + _GRID_GAP
+            cell_y = y + max(0, (scaled_row_height - new_h) // 2)
+            canvas.paste(img, (x, cell_y))
+        y += scaled_row_height + _GRID_GAP
 
     return [canvas], canvas.height + _GRID_GAP
 
